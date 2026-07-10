@@ -124,6 +124,9 @@ from subagents_pydantic_ai.types import (
     CompiledSubAgent as CompiledSubAgent,
 )
 from subagents_pydantic_ai.types import (
+    DelegationConfiguration as DelegationConfiguration,
+)
+from subagents_pydantic_ai.types import (
     ExecutionMode as ExecutionMode,
 )
 from subagents_pydantic_ai.types import (
@@ -170,6 +173,7 @@ __all__ = [
     "TaskPriority",
     "TaskCharacteristics",
     "ExecutionMode",
+    "DelegationConfiguration",
     "ToolsetFactory",
     "UsageLimitsFactory",
     "AskUserCallback",

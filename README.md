@@ -175,7 +175,6 @@ Create agents on-the-fly and delegate to them seamlessly:
 ```python
 from subagents_pydantic_ai import (
     create_subagent_toolset,
-    create_agent_factory_toolset,
     DynamicAgentRegistry,
 )
 
@@ -184,15 +183,10 @@ registry = DynamicAgentRegistry()
 agent = Agent(
     "openai:gpt-4o",
     deps_type=Deps,
-    toolsets=[
-        # Pass registry so task() can resolve dynamically created agents
-        create_subagent_toolset(registry=registry),
-        create_agent_factory_toolset(
-            registry=registry,
-            allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
-            max_agents=5,
-        ),
-    ],
+    toolsets=[create_subagent_toolset(
+        registry=registry,
+        allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
+    )],
 )
 
 # Now the agent can:
@@ -200,15 +194,23 @@ agent = Agent(
 # 2. task(description="...", subagent_type="analyst") — delegates to it
 ```
 
-### One-Shot Delegation
+### Delegation Configuration
 
-For one-off specialists, enable `oneshot_delegation=True` to expose a `delegate` tool that creates an ephemeral agent and runs its task in a single call. The specialist is **not** registered and cannot be reused by name:
+Choose which delegation entry points are exposed:
+
+| Mode | Entry-point tools |
+|------|-------------------|
+| `"default"` | `create_agent`, `task` |
+| `"persisted_and_oneshot"` | `create_agent`, `task`, `delegate` |
+| `"oneshot_only"` | `delegate` |
+
+Async task lifecycle tools remain available in every mode. One-shot specialists are **not** registered and cannot be reused by name.
 
 ```python
 from subagents_pydantic_ai import create_subagent_toolset
 
 toolset = create_subagent_toolset(
-    oneshot_delegation=True,
+    delegation_configuration="persisted_and_oneshot",
     allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
     capabilities_map={
         "filesystem": lambda deps: [create_fs_toolset(deps.backend)],
@@ -245,8 +247,9 @@ The parent agent can then respond using `answer_subagent(task_id, answer)`.
 
 | Tool | Description |
 |------|-------------|
+| `create_agent` | Create a reusable registry-backed specialist |
 | `task` | Delegate a task to a subagent (sync, async, or auto) |
-| `delegate` | Create and run an ephemeral specialist in one call (when `oneshot_delegation=True`) |
+| `delegate` | Create and run an ephemeral specialist in one call |
 | `check_task` | Check status and get result of a background task |
 | `answer_subagent` | Answer a question from a blocked subagent |
 | `list_active_tasks` | List all running background tasks |

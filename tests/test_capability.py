@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +13,14 @@ from pydantic_ai.models.test import TestModel
 from subagents_pydantic_ai import SubAgentCapability, SubAgentConfig
 
 _MODEL = TestModel()
+
+
+@dataclass
+class MockDeps:
+    subagents: dict[str, Any] = field(default_factory=dict)
+
+    def clone_for_subagent(self, max_depth: int = 0) -> MockDeps:
+        return MockDeps(subagents={} if max_depth <= 0 else self.subagents.copy())
 
 
 def _cap(**kwargs):
@@ -105,22 +115,38 @@ class TestSubAgentCapability:
         assert cap.usage_limits is usage_limits
         assert create_toolset.call_args.kwargs["usage_limits"] is usage_limits
 
-    def test_oneshot_delegation_forwarded_to_toolset(self):
+    def test_delegation_configuration_forwarded_to_toolset(self):
         with patch("subagents_pydantic_ai.capability.create_subagent_toolset") as create_toolset:
             cap = _cap(
-                oneshot_delegation=True,
+                delegation_configuration="persisted_and_oneshot",
                 allowed_models=["openai:gpt-4.1"],
             )
 
-        assert cap.oneshot_delegation is True
-        assert create_toolset.call_args.kwargs["oneshot_delegation"] is True
+        assert cap.delegation_configuration == "persisted_and_oneshot"
+        assert (
+            create_toolset.call_args.kwargs["delegation_configuration"] == "persisted_and_oneshot"
+        )
         assert create_toolset.call_args.kwargs["allowed_models"] == ["openai:gpt-4.1"]
 
-    def test_delegate_tool_present_when_enabled(self):
-        cap = _cap(oneshot_delegation=True, include_general_purpose=False)
+    def test_delegate_tool_present_in_combined_mode(self):
+        cap = _cap(
+            delegation_configuration="persisted_and_oneshot",
+            include_general_purpose=False,
+        )
         toolset = cap.get_toolset()
         assert toolset is not None
         assert "delegate" in toolset.tools
+
+    def test_oneshot_only_instructions_reference_delegate(self):
+        cap = _cap(
+            delegation_configuration="oneshot_only",
+            include_general_purpose=False,
+        )
+        instructions_fn = cap.get_instructions()
+        ctx = type("FakeCtx", (), {"deps": None})()
+        result = instructions_fn(ctx)
+        assert "delegate" in result
+        assert "`task`" not in result
 
 
 class TestSubAgentCapabilityIntegration:
@@ -130,8 +156,8 @@ class TestSubAgentCapabilityIntegration:
     async def test_agent_with_capability(self):
         """Agent with SubAgentCapability can run successfully."""
         cap = _cap()
-        agent = Agent(_MODEL, capabilities=[cap])
-        result = await agent.run("Delegate a task")
+        agent = Agent(_MODEL, deps_type=MockDeps, capabilities=[cap])
+        result = await agent.run("Delegate a task", deps=MockDeps())
         assert result.output is not None
 
     @pytest.mark.anyio
@@ -145,8 +171,8 @@ class TestSubAgentCapabilityIntegration:
             ),
         ]
         cap = _cap(subagents=configs)
-        agent = Agent(_MODEL, capabilities=[cap])
-        result = await agent.run("Analyze something")
+        agent = Agent(_MODEL, deps_type=MockDeps, capabilities=[cap])
+        result = await agent.run("Analyze something", deps=MockDeps())
         assert result.output is not None
 
     @pytest.mark.anyio

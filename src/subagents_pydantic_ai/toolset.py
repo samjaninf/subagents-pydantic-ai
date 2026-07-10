@@ -33,11 +33,13 @@ from subagents_pydantic_ai.prompts import (
     get_task_instructions_prompt,
 )
 from subagents_pydantic_ai.protocols import SubAgentDepsProtocol
+from subagents_pydantic_ai.registry import DynamicAgentRegistry
 from subagents_pydantic_ai.retry import RetryConfig, run_with_retry
 from subagents_pydantic_ai.types import (
     AgentMessage,
     AskUserCallback,
     CompiledSubAgent,
+    DelegationConfiguration,
     ExecutionMode,
     MessageType,
     SubAgentConfig,
@@ -326,18 +328,19 @@ def create_subagent_toolset(  # noqa: C901
     descriptions: dict[str, str] | None = None,
     ask_user: AskUserCallback | None = None,
     usage_limits: UsageLimits | UsageLimitsFactory | None = None,
-    oneshot_delegation: bool = False,
+    delegation_configuration: DelegationConfiguration = "default",
     allowed_models: list[str] | None = None,
     capabilities_map: dict[str, CapabilityFactory] | None = None,
     default_agent_factory: Any | None = None,
+    max_agents: int = 10,
 ) -> FunctionToolset[Any]:
     """Create a toolset for delegating tasks to subagents.
 
     This is the main entry point for using the subagent system. It creates
     a toolset with tools for:
-    - `task`: Delegate a task to a subagent (sync or async)
-    - `delegate`: Create and run an ephemeral specialist in one call (when
-      `oneshot_delegation=True`)
+    - `create_agent`: Create a reusable, registry-backed specialist
+    - `task`: Delegate a task to a configured or registry-backed specialist
+    - `delegate`: Create and run an ephemeral specialist in one call
     - `check_task`: Check status of an async task
     - `answer_subagent`: Answer a question from a subagent
     - `list_active_tasks`: List all running background tasks
@@ -371,13 +374,17 @@ def create_subagent_toolset(  # noqa: C901
             context and selected subagent config. A factory may return `None`
             to run that task without explicit limits. Limits are honoured on
             every retry attempt as well.
-        oneshot_delegation: When True, expose a `delegate` tool that creates an
-            ephemeral specialist and runs its task in one call. The specialist
-            is not registered in the dynamic agent registry.
-        allowed_models: Optional model allow-list for one-shot specialists.
-        capabilities_map: Optional capability factories for one-shot specialists.
-        default_agent_factory: Optional custom agent factory for one-shot
-            specialists. When set, `capabilities` on `delegate` are rejected.
+        delegation_configuration: Controls the delegation entry points:
+            `"default"` exposes `create_agent` and `task`;
+            `"persisted_and_oneshot"` also exposes `delegate`;
+            `"oneshot_only"` exposes only `delegate`.
+            Async task lifecycle tools remain available in every mode.
+        allowed_models: Optional model allow-list for dynamically created specialists.
+        capabilities_map: Optional capability factories for dynamically created
+            specialists.
+        default_agent_factory: Optional custom agent factory for dynamically
+            created specialists. When set, requested `capabilities` are rejected.
+        max_agents: Maximum number of persistent dynamic agents.
 
     Returns:
         FunctionToolset configured with subagent management tools.
@@ -403,7 +410,18 @@ def create_subagent_toolset(  # noqa: C901
         agent = Agent("openai:gpt-4.1", toolsets=[toolset])
         ```
     """
+    valid_configurations = {"default", "persisted_and_oneshot", "oneshot_only"}
+    if delegation_configuration not in valid_configurations:
+        valid = ", ".join(sorted(valid_configurations))
+        raise ValueError(
+            f"Invalid delegation_configuration '{delegation_configuration}'. "
+            f"Expected one of: {valid}"
+        )
+
     _descs = descriptions or {}
+    active_registry: Any = (
+        registry if registry is not None else DynamicAgentRegistry(max_agents=max_agents)
+    )
 
     # Build subagent configs
     configs: list[SubAgentConfig] = list(subagents) if subagents else []
@@ -427,6 +445,72 @@ def create_subagent_toolset(  # noqa: C901
     )
 
     toolset: FunctionToolset[Any] = FunctionToolset(id=id or "subagents")
+
+    models_desc = (
+        f"Allowed models: {', '.join(allowed_models)}" if allowed_models else "Any model is allowed"
+    )
+    caps_desc = (
+        f"Available capabilities: {', '.join(capabilities_map.keys())}"
+        if capabilities_map
+        else "No predefined capabilities available"
+    )
+
+    if delegation_configuration != "oneshot_only":
+        create_agent_description = _descs.get(
+            "create_agent",
+            "Create a reusable specialized agent at runtime. The agent is stored "
+            "in the registry and can be used repeatedly with the task tool.\n\n"
+            f"{models_desc}\n{caps_desc}\n\n"
+            f"Default model when none is given: {default_model}.",
+        )
+
+        @toolset.tool(description=create_agent_description)
+        async def create_agent(
+            ctx: RunContext[SubAgentDepsProtocol],
+            name: str,
+            description: str,
+            instructions: str,
+            model: str | None = None,
+            capabilities: list[str] | None = None,
+            can_ask_questions: bool = True,
+        ) -> str:
+            """Create and register a reusable specialized agent."""
+            if active_registry.exists(name):
+                return f"Error: Agent '{name}' already exists"
+
+            actual_model = model or default_model
+            agent, config, error = build_dynamic_agent(
+                ctx,
+                name=name,
+                description=description,
+                instructions=instructions,
+                model=actual_model,
+                can_ask_questions=can_ask_questions,
+                capabilities=capabilities,
+                allowed_models=allowed_models,
+                toolsets_factory=None,
+                capabilities_map=capabilities_map,
+                default_agent_factory=default_agent_factory,
+            )
+            if error is not None:
+                return error
+            if config is None or agent is None:
+                return "Error creating agent"
+
+            try:
+                active_registry.register(config, agent)
+            except ValueError as exc:
+                return f"Error: {exc}"
+            except Exception as exc:
+                return f"Error creating agent: {exc}"
+
+            caps_info = f"\nCapabilities: {', '.join(capabilities)}" if capabilities else ""
+            return (
+                f"Agent '{name}' created successfully.\n"
+                f"Model: {actual_model}\n"
+                f"Description: {description}{caps_info}\n"
+                f"Use task(description, '{name}') to delegate tasks."
+            )
 
     @toolset.tool(description=task_description)
     async def task(
@@ -456,17 +540,17 @@ def create_subagent_toolset(  # noqa: C901
             subagent = compiled[subagent_type]
             inject_ask_parent = False
         elif (
-            registry is not None
-            and hasattr(registry, "get_compiled")
-            and registry.get_compiled(subagent_type)
+            active_registry is not None
+            and hasattr(active_registry, "get_compiled")
+            and active_registry.get_compiled(subagent_type)
         ):
-            subagent = registry.get_compiled(subagent_type)
+            subagent = active_registry.get_compiled(subagent_type)
             inject_ask_parent = True
         else:
             # Build available list from both sources
             available_names = list(compiled.keys())
-            if registry is not None and hasattr(registry, "list_agents"):
-                available_names.extend(registry.list_agents())
+            if active_registry is not None and hasattr(active_registry, "list_agents"):
+                available_names.extend(active_registry.list_agents())
             available = ", ".join(available_names)
             return f"Error: Unknown subagent '{subagent_type}'. Available: {available}"
 
@@ -488,17 +572,7 @@ def create_subagent_toolset(  # noqa: C901
             inject_ask_parent=inject_ask_parent,
         )
 
-    if oneshot_delegation:
-        models_desc = (
-            f"Allowed models: {', '.join(allowed_models)}"
-            if allowed_models
-            else "Any model is allowed"
-        )
-        caps_desc = (
-            f"Available capabilities: {', '.join(capabilities_map.keys())}"
-            if capabilities_map
-            else "No predefined capabilities available"
-        )
+    if delegation_configuration != "default":
         delegate_description = _descs.get(
             "delegate",
             DELEGATE_TOOL_DESCRIPTION.rstrip()
@@ -824,6 +898,9 @@ def create_subagent_toolset(  # noqa: C901
         return totals
 
     toolset.get_total_usage = get_total_usage  # type: ignore[attr-defined]
+
+    if delegation_configuration == "oneshot_only":
+        toolset.tools.pop("task")
 
     return toolset
 

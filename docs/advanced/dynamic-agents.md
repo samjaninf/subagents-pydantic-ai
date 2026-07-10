@@ -1,6 +1,6 @@
 # Dynamic Agent Creation
 
-Create specialized agents at runtime using the agent factory toolset.
+Create reusable or ephemeral specialized agents at runtime.
 
 ## Overview
 
@@ -10,14 +10,13 @@ While pre-configured subagents cover most use cases, sometimes you need to creat
 - Task requires a unique combination of capabilities
 - Experimentation with different agent configurations
 
-## Agent Factory Toolset
+## Delegation Toolset
 
-Add dynamic creation capabilities:
+`create_subagent_toolset` exposes persistent creation and task delegation by default:
 
 ```python
 from subagents_pydantic_ai import (
     create_subagent_toolset,
-    create_agent_factory_toolset,
     DynamicAgentRegistry,
 )
 
@@ -26,14 +25,11 @@ registry = DynamicAgentRegistry()
 agent = Agent(
     "openai:gpt-4o",
     deps_type=Deps,
-    toolsets=[
-        create_subagent_toolset(subagents=base_subagents),
-        create_agent_factory_toolset(
-            registry=registry,
-            allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
-            max_agents=5,
-        ),
-    ],
+    toolsets=[create_subagent_toolset(
+        subagents=base_subagents,
+        registry=registry,
+        allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
+    )],
 )
 ```
 
@@ -41,16 +37,16 @@ agent = Agent(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `registry` | `DynamicAgentRegistry` | Required | Registry for created agents |
+| `registry` | `DynamicAgentRegistry \| None` | `None` | Registry for created agents; an internal registry is created when omitted |
 | `allowed_models` | `list[str] \| None` | `None` (all allowed) | Models agents can use |
 | `default_model` | `str \| Model` | `"openai:gpt-4.1"` | Default model for new agents when none is given |
 | `max_agents` | `int` | `10` | Maximum dynamic agents |
 | `toolsets_factory` | `ToolsetFactory \| None` | `None` | Factory that builds toolsets for every new agent. Takes priority over `capabilities_map` when both are set |
 | `capabilities_map` | `dict[str, CapabilityFactory] \| None` | `None` | Maps capability names to factory functions, e.g. `{"filesystem": ..., "todo": ...}`. Used when `capabilities` are passed to `create_agent` |
-| `id` | `str \| None` | `None` (-> `"agent_factory"`) | Optional toolset ID |
+| `delegation_configuration` | `DelegationConfiguration` | `"default"` | Select persistent, combined, or one-shot-only entry points |
 | `default_agent_factory` | `Callable \| None` | `None` | Factory used to build every dynamic agent |
 
-See [`create_agent_factory_toolset`][subagents_pydantic_ai.factory.create_agent_factory_toolset]
+See [`create_subagent_toolset`][subagents_pydantic_ai.toolset.create_subagent_toolset]
 for the full signature.
 
 ## DynamicAgentRegistry
@@ -314,26 +310,33 @@ create_agent_factory_toolset(
 
 ### Agent Limits
 
-Prevent unlimited agent creation:
+Prevent unlimited agent creation when the toolset creates its internal registry:
 
 ```python
-create_agent_factory_toolset(
-    registry=registry,
+create_subagent_toolset(
     max_agents=3,  # Maximum 3 dynamic agents
 )
 ```
 
 After reaching the limit, creating new agents will fail until existing ones are removed.
 
-## One-Shot Delegation
+## Delegation Modes
 
-For one-off specialists, enable `oneshot_delegation=True` on the subagent toolset (or `SubAgentCapability`). This exposes a `delegate` tool that combines agent creation and task execution in a single call.
+`delegation_configuration` controls the primary tools exposed to the parent:
+
+| Mode | Entry-point tools | Use case |
+|------|-------------------|----------|
+| `"default"` | `create_agent`, `task` | Reusable specialists |
+| `"persisted_and_oneshot"` | `create_agent`, `task`, `delegate` | Reusable and ad-hoc specialists |
+| `"oneshot_only"` | `delegate` | Minimal one-shot delegation |
+
+Async lifecycle tools such as `check_task` remain available in every mode.
 
 ```python
 from subagents_pydantic_ai import create_subagent_toolset
 
 toolset = create_subagent_toolset(
-    oneshot_delegation=True,
+    delegation_configuration="persisted_and_oneshot",
     allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
     capabilities_map={
         "filesystem": lambda deps: [create_fs_toolset(deps.backend)],

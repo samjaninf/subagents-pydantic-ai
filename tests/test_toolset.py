@@ -3206,25 +3206,73 @@ class TestSendMessageToSubagent:
         assert msgs[0].payload == {"message": "narrow the scope"}
 
 
-class TestOneshotDelegation:
-    """Tests for the optional delegate tool."""
+class TestDelegationConfiguration:
+    """Tests for configurable delegation entry points."""
 
-    def test_delegate_hidden_by_default(self):
+    def test_default_exposes_persisted_tools(self):
         toolset = create_subagent_toolset(include_general_purpose=False)
         assert "delegate" not in toolset.tools
+        assert "create_agent" in toolset.tools
+        assert "task" in toolset.tools
 
-    def test_delegate_exposed_when_enabled(self):
+    def test_persisted_and_oneshot_exposes_all_entry_points(self):
         toolset = create_subagent_toolset(
-            oneshot_delegation=True,
+            delegation_configuration="persisted_and_oneshot",
             include_general_purpose=False,
         )
         assert "delegate" in toolset.tools
+        assert "create_agent" in toolset.tools
         assert "task" in toolset.tools
+
+    def test_oneshot_only_exposes_only_delegate_entry_point(self):
+        toolset = create_subagent_toolset(
+            delegation_configuration="oneshot_only",
+            include_general_purpose=False,
+        )
+        assert "delegate" in toolset.tools
+        assert "create_agent" not in toolset.tools
+        assert "task" not in toolset.tools
+        assert "check_task" in toolset.tools
+
+    def test_invalid_configuration_is_rejected(self):
+        with pytest.raises(ValueError, match="Invalid delegation_configuration"):
+            create_subagent_toolset(
+                delegation_configuration="invalid",  # type: ignore[arg-type]
+                include_general_purpose=False,
+            )
+
+    @pytest.mark.asyncio
+    async def test_create_agent_registers_reusable_agent(self, registry):
+        toolset = create_subagent_toolset(
+            registry=registry,
+            include_general_purpose=False,
+        )
+        create_tool = toolset.tools["create_agent"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
+            mock_agent_class.return_value = FakeAgent(result=MockResult("persisted result"))
+            result = await create_tool.function(
+                ctx,
+                name="analyst",
+                description="Analyzes data",
+                instructions="You are a data analyst.",
+            )
+
+        assert "created successfully" in result
+        assert registry.exists("analyst")
+
+        task_result = await toolset.tools["task"].function(
+            ctx,
+            description="Analyze the data",
+            subagent_type="analyst",
+        )
+        assert task_result == "persisted result"
 
     @pytest.mark.asyncio
     async def test_delegate_sync_success(self):
         toolset = create_subagent_toolset(
-            oneshot_delegation=True,
+            delegation_configuration="persisted_and_oneshot",
             include_general_purpose=False,
         )
         delegate_tool = toolset.tools["delegate"]
@@ -3244,7 +3292,7 @@ class TestOneshotDelegation:
     async def test_delegate_does_not_register_agent(self, registry):
         registry.max_agents = 1
         toolset = create_subagent_toolset(
-            oneshot_delegation=True,
+            delegation_configuration="persisted_and_oneshot",
             registry=registry,
             include_general_purpose=False,
         )
@@ -3274,7 +3322,7 @@ class TestOneshotDelegation:
             MagicMock(),
         )
         toolset = create_subagent_toolset(
-            oneshot_delegation=True,
+            delegation_configuration="persisted_and_oneshot",
             registry=registry,
             include_general_purpose=False,
         )
@@ -3295,7 +3343,7 @@ class TestOneshotDelegation:
     @pytest.mark.asyncio
     async def test_delegate_async_success(self):
         toolset = create_subagent_toolset(
-            oneshot_delegation=True,
+            delegation_configuration="persisted_and_oneshot",
             include_general_purpose=False,
         )
         delegate_tool = toolset.tools["delegate"]
@@ -3324,7 +3372,7 @@ class TestOneshotDelegation:
     @pytest.mark.asyncio
     async def test_delegate_disallowed_model(self):
         toolset = create_subagent_toolset(
-            oneshot_delegation=True,
+            delegation_configuration="persisted_and_oneshot",
             include_general_purpose=False,
             allowed_models=["openai:gpt-4.1"],
         )
@@ -3344,7 +3392,7 @@ class TestOneshotDelegation:
     @pytest.mark.asyncio
     async def test_delegate_invalid_capability(self):
         toolset = create_subagent_toolset(
-            oneshot_delegation=True,
+            delegation_configuration="persisted_and_oneshot",
             include_general_purpose=False,
             capabilities_map={"filesystem": lambda deps: []},
         )
@@ -3364,7 +3412,7 @@ class TestOneshotDelegation:
     @pytest.mark.asyncio
     async def test_delegate_execution_error(self):
         toolset = create_subagent_toolset(
-            oneshot_delegation=True,
+            delegation_configuration="persisted_and_oneshot",
             include_general_purpose=False,
         )
         delegate_tool = toolset.tools["delegate"]

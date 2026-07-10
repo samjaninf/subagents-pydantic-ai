@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **One-shot delegation via `delegate` tool.** Opt in with `oneshot_delegation=True` on `create_subagent_toolset` or `SubAgentCapability`. The new `delegate` tool creates an ephemeral specialist and runs its task in one call, bypassing the dynamic agent registry. Shared dynamic-agent validation and construction logic was extracted into `dynamic_agent.py` and reused by `create_agent_factory_toolset`.
+- **Configurable persistent and one-shot delegation.** `delegation_configuration` on `create_subagent_toolset` and `SubAgentCapability` selects `"default"` (`create_agent` + `task`), `"persisted_and_oneshot"` (also `delegate`), or `"oneshot_only"` (`delegate` only). The ephemeral `delegate` path bypasses the registry, while `create_agent` stores reusable specialists for later `task` calls. Shared dynamic-agent validation and construction logic lives in `dynamic_agent.py`.
 
 ## [0.2.8] - 2026-06-26
 

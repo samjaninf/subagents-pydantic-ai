@@ -29,10 +29,11 @@ toolset = create_subagent_toolset(subagents=subagents)
 | `max_nesting_depth` | `int` | `0` | Maximum subagent nesting depth |
 | `registry` | `DynamicAgentRegistry \| None` | `None` | Registry for dynamically created agents |
 | `descriptions` | `dict[str, str] \| None` | `None` | Override default tool descriptions by tool name |
-| `oneshot_delegation` | `bool` | `False` | Expose `delegate` for ephemeral create-and-run |
-| `allowed_models` | `list[str] \| None` | `None` | Model allow-list for one-shot specialists |
-| `capabilities_map` | `dict[str, Callable] \| None` | `None` | Capability factories for one-shot specialists |
-| `default_agent_factory` | `Callable \| None` | `None` | Custom agent factory for one-shot specialists |
+| `delegation_configuration` | `DelegationConfiguration` | `"default"` | Controls whether persistent, one-shot, or both entry points are exposed |
+| `allowed_models` | `list[str] \| None` | `None` | Model allow-list for dynamic specialists |
+| `capabilities_map` | `dict[str, Callable] \| None` | `None` | Capability factories for dynamic specialists |
+| `default_agent_factory` | `Callable \| None` | `None` | Custom agent factory for dynamic specialists |
+| `max_agents` | `int` | `10` | Maximum persistent agents in an internally created registry |
 
 ## Adding to an Agent
 
@@ -93,6 +94,22 @@ See [SubAgentConfig](types.md#subagentconfig) for full documentation of the `age
 
 The toolset provides these tools to your agent:
 
+### Delegation modes
+
+| Mode | Entry-point tools |
+|------|-------------------|
+| `"default"` | `create_agent`, `task` |
+| `"persisted_and_oneshot"` | `create_agent`, `task`, `delegate` |
+| `"oneshot_only"` | `delegate` |
+
+Task lifecycle tools remain available in every mode so async work can be checked,
+steered, awaited, answered, or cancelled.
+
+### create_agent
+
+Create and register a reusable specialist. The resulting name can be passed to
+`task` multiple times.
+
 ### task
 
 Delegate a task to a subagent.
@@ -116,7 +133,8 @@ task(
 
 ### delegate
 
-Create an ephemeral specialist and delegate a task in one call. Available when `oneshot_delegation=True`.
+Create an ephemeral specialist and delegate a task in one call. Available in
+`"persisted_and_oneshot"` and `"oneshot_only"` modes.
 
 ```python
 # The agent calls:
