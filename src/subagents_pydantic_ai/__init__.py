@@ -55,6 +55,9 @@ from subagents_pydantic_ai.prompts import (
     DEFAULT_GENERAL_PURPOSE_DESCRIPTION as DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
 )
 from subagents_pydantic_ai.prompts import (
+    DELEGATE_TOOL_DESCRIPTION as DELEGATE_TOOL_DESCRIPTION,
+)
+from subagents_pydantic_ai.prompts import (
     DUAL_MODE_SYSTEM_PROMPT as DUAL_MODE_SYSTEM_PROMPT,
 )
 from subagents_pydantic_ai.prompts import (
@@ -195,6 +198,7 @@ __all__ = [
     "SUBAGENT_SYSTEM_PROMPT",
     "DUAL_MODE_SYSTEM_PROMPT",
     "DEFAULT_GENERAL_PURPOSE_DESCRIPTION",
+    "DELEGATE_TOOL_DESCRIPTION",
     "TASK_TOOL_DESCRIPTION",
     "CHECK_TASK_DESCRIPTION",
     "ANSWER_SUBAGENT_DESCRIPTION",

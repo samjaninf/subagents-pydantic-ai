@@ -3204,3 +3204,179 @@ class TestSendMessageToSubagent:
         assert len(msgs) == 1
         assert msgs[0].type == MessageType.TASK_UPDATE
         assert msgs[0].payload == {"message": "narrow the scope"}
+
+
+class TestOneshotDelegation:
+    """Tests for the optional delegate tool."""
+
+    def test_delegate_hidden_by_default(self):
+        toolset = create_subagent_toolset(include_general_purpose=False)
+        assert "delegate" not in toolset.tools
+
+    def test_delegate_exposed_when_enabled(self):
+        toolset = create_subagent_toolset(
+            oneshot_delegation=True,
+            include_general_purpose=False,
+        )
+        assert "delegate" in toolset.tools
+        assert "task" in toolset.tools
+
+    @pytest.mark.asyncio
+    async def test_delegate_sync_success(self):
+        toolset = create_subagent_toolset(
+            oneshot_delegation=True,
+            include_general_purpose=False,
+        )
+        delegate_tool = toolset.tools["delegate"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
+            mock_agent_class.return_value = FakeAgent(result=MockResult("oneshot result"))
+            result = await delegate_tool.function(
+                ctx,
+                description="Analyze the data",
+                instructions="You are a data analyst.",
+            )
+
+        assert result == "oneshot result"
+
+    @pytest.mark.asyncio
+    async def test_delegate_does_not_register_agent(self, registry):
+        registry.max_agents = 1
+        toolset = create_subagent_toolset(
+            oneshot_delegation=True,
+            registry=registry,
+            include_general_purpose=False,
+        )
+        delegate_tool = toolset.tools["delegate"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
+            mock_agent_class.return_value = FakeAgent(result=MockResult("oneshot result"))
+            result = await delegate_tool.function(
+                ctx,
+                description="Do work",
+                instructions="You are a worker.",
+            )
+
+        assert result == "oneshot result"
+        assert registry.count() == 0
+
+    @pytest.mark.asyncio
+    async def test_delegate_works_when_registry_full(self, registry):
+        registry.max_agents = 1
+        registry.register(
+            SubAgentConfig(
+                name="existing",
+                description="Existing agent",
+                instructions="Existing",
+            ),
+            MagicMock(),
+        )
+        toolset = create_subagent_toolset(
+            oneshot_delegation=True,
+            registry=registry,
+            include_general_purpose=False,
+        )
+        delegate_tool = toolset.tools["delegate"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
+            mock_agent_class.return_value = FakeAgent(result=MockResult("still works"))
+            result = await delegate_tool.function(
+                ctx,
+                description="Do work",
+                instructions="You are a worker.",
+            )
+
+        assert result == "still works"
+        assert registry.count() == 1
+
+    @pytest.mark.asyncio
+    async def test_delegate_async_success(self):
+        toolset = create_subagent_toolset(
+            oneshot_delegation=True,
+            include_general_purpose=False,
+        )
+        delegate_tool = toolset.tools["delegate"]
+        check_tool = toolset.tools["check_task"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
+            mock_agent_class.return_value = FakeAgent(result=MockResult("async oneshot"))
+            start_result = await delegate_tool.function(
+                ctx,
+                description="Long analysis",
+                instructions="You are an analyst.",
+                mode="async",
+            )
+
+        assert "Task ID:" in start_result
+        task_id = start_result.split("Task ID: ")[1].split("\n")[0]
+        handle = toolset.task_manager.get_handle(task_id)
+        assert handle is not None
+        assert handle.subagent_name.startswith("oneshot-")
+
+        await asyncio.sleep(0.05)
+        status = await check_tool.function(ctx, task_id)
+        assert "COMPLETED" in status or "async oneshot" in status
+
+    @pytest.mark.asyncio
+    async def test_delegate_disallowed_model(self):
+        toolset = create_subagent_toolset(
+            oneshot_delegation=True,
+            include_general_purpose=False,
+            allowed_models=["openai:gpt-4.1"],
+        )
+        delegate_tool = toolset.tools["delegate"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        result = await delegate_tool.function(
+            ctx,
+            description="Do work",
+            instructions="You are a worker.",
+            model="anthropic:claude-3",
+        )
+
+        assert "Error" in result
+        assert "not allowed" in result
+
+    @pytest.mark.asyncio
+    async def test_delegate_invalid_capability(self):
+        toolset = create_subagent_toolset(
+            oneshot_delegation=True,
+            include_general_purpose=False,
+            capabilities_map={"filesystem": lambda deps: []},
+        )
+        delegate_tool = toolset.tools["delegate"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        result = await delegate_tool.function(
+            ctx,
+            description="Do work",
+            instructions="You are a worker.",
+            capabilities=["missing"],
+        )
+
+        assert "Error" in result
+        assert "Unknown capabilities" in result
+
+    @pytest.mark.asyncio
+    async def test_delegate_execution_error(self):
+        toolset = create_subagent_toolset(
+            oneshot_delegation=True,
+            include_general_purpose=False,
+        )
+        delegate_tool = toolset.tools["delegate"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
+            mock_agent_class.return_value = FakeAgent(error=Exception("delegate failed"))
+            result = await delegate_tool.function(
+                ctx,
+                description="Do work",
+                instructions="You are a worker.",
+            )
+
+        assert "Error executing task" in result
+        assert "delegate failed" in result

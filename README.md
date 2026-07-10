@@ -200,6 +200,31 @@ agent = Agent(
 # 2. task(description="...", subagent_type="analyst") — delegates to it
 ```
 
+### One-Shot Delegation
+
+For one-off specialists, enable `oneshot_delegation=True` to expose a `delegate` tool that creates an ephemeral agent and runs its task in a single call. The specialist is **not** registered and cannot be reused by name:
+
+```python
+from subagents_pydantic_ai import create_subagent_toolset
+
+toolset = create_subagent_toolset(
+    oneshot_delegation=True,
+    allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
+    capabilities_map={
+        "filesystem": lambda deps: [create_fs_toolset(deps.backend)],
+    },
+)
+
+# Parent agent calls:
+# delegate(
+#     description="Analyze this CSV and summarize trends",
+#     instructions="You are a data analyst. Return concise findings.",
+#     mode="sync",
+# )
+```
+
+Use `create_agent` + `task` when you need a reusable specialist. Use `delegate` for ephemeral one-off work.
+
 ## Subagent Questions
 
 Enable subagents to ask the parent for clarification:
@@ -221,6 +246,7 @@ The parent agent can then respond using `answer_subagent(task_id, answer)`.
 | Tool | Description |
 |------|-------------|
 | `task` | Delegate a task to a subagent (sync, async, or auto) |
+| `delegate` | Create and run an ephemeral specialist in one call (when `oneshot_delegation=True`) |
 | `check_task` | Check status and get result of a background task |
 | `answer_subagent` | Answer a question from a blocked subagent |
 | `list_active_tasks` | List all running background tasks |

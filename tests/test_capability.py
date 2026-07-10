@@ -105,6 +105,23 @@ class TestSubAgentCapability:
         assert cap.usage_limits is usage_limits
         assert create_toolset.call_args.kwargs["usage_limits"] is usage_limits
 
+    def test_oneshot_delegation_forwarded_to_toolset(self):
+        with patch("subagents_pydantic_ai.capability.create_subagent_toolset") as create_toolset:
+            cap = _cap(
+                oneshot_delegation=True,
+                allowed_models=["openai:gpt-4.1"],
+            )
+
+        assert cap.oneshot_delegation is True
+        assert create_toolset.call_args.kwargs["oneshot_delegation"] is True
+        assert create_toolset.call_args.kwargs["allowed_models"] == ["openai:gpt-4.1"]
+
+    def test_delegate_tool_present_when_enabled(self):
+        cap = _cap(oneshot_delegation=True, include_general_purpose=False)
+        toolset = cap.get_toolset()
+        assert toolset is not None
+        assert "delegate" in toolset.tools
+
 
 class TestSubAgentCapabilityIntegration:
     """Integration tests with real Agent."""

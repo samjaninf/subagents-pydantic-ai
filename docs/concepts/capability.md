@@ -50,8 +50,26 @@ SubAgentCapability(
     usage_limits=UsageLimits(           # Static limits, or a factory (see below)
         request_limit=10,
     ),
+    oneshot_delegation=False,           # Expose delegate for ephemeral create-and-run
+    allowed_models=None,                # Model allow-list for one-shot specialists
+    capabilities_map=None,              # Capability factories for one-shot specialists
+    default_agent_factory=None,         # Custom agent factory for one-shot specialists
 )
 ```
+
+### One-shot delegation
+
+Set `oneshot_delegation=True` to expose a `delegate` tool that creates an ephemeral specialist and runs its task in one call. The specialist is not registered in the dynamic agent registry.
+
+```python
+SubAgentCapability(
+    oneshot_delegation=True,
+    allowed_models=["openai:gpt-4.1"],
+    capabilities_map={"filesystem": lambda deps: [create_fs_toolset(deps.backend)]},
+)
+```
+
+Use `delegate` for one-off specialists. Use `task` with pre-configured or registry-backed agents for reusable delegation.
 
 ### Usage limits
 
@@ -82,8 +100,8 @@ cap = SubAgentCapability(subagents=[...], usage_limits=limits_for)
 When you pass `SubAgentCapability` to an agent, pydantic-ai calls:
 
 1. **`get_toolset()`** — returns the `FunctionToolset` containing delegation tools
-   (`task`, `check_task`, `answer_subagent`, `list_active_tasks`, `wait_tasks`,
-   `soft_cancel_task`, `hard_cancel_task`)
+   (`task`, `delegate` when `oneshot_delegation=True`, `check_task`, `answer_subagent`,
+   `list_active_tasks`, `wait_tasks`, `soft_cancel_task`, `hard_cancel_task`)
 
 2. **`get_instructions()`** — returns a callable that generates the system prompt
    listing available subagents with their descriptions (via

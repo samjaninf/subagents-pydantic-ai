@@ -25,9 +25,14 @@ toolset = create_subagent_toolset(subagents=subagents)
 | `subagents` | `list[SubAgentConfig]` | `[]` | List of subagent configurations |
 | `default_model` | `str \| None` | `None` | Default model for subagents |
 | `toolsets_factory` | `Callable` | `None` | Factory to create toolsets for subagents |
-| `max_nesting_depth` | `int` | `2` | Maximum subagent nesting depth |
-| `general_purpose_config` | `SubAgentConfig \| None` | Auto | Config for the "general" subagent |
+| `include_general_purpose` | `bool` | `True` | Include the general-purpose subagent |
+| `max_nesting_depth` | `int` | `0` | Maximum subagent nesting depth |
+| `registry` | `DynamicAgentRegistry \| None` | `None` | Registry for dynamically created agents |
 | `descriptions` | `dict[str, str] \| None` | `None` | Override default tool descriptions by tool name |
+| `oneshot_delegation` | `bool` | `False` | Expose `delegate` for ephemeral create-and-run |
+| `allowed_models` | `list[str] \| None` | `None` | Model allow-list for one-shot specialists |
+| `capabilities_map` | `dict[str, Callable] \| None` | `None` | Capability factories for one-shot specialists |
+| `default_agent_factory` | `Callable \| None` | `None` | Custom agent factory for one-shot specialists |
 
 ## Adding to an Agent
 
@@ -108,6 +113,32 @@ task(
 | `description` | `str` | What the subagent should do |
 | `subagent_type` | `str` | Name of the subagent to use |
 | `mode` | `str` | `"sync"`, `"async"`, or `"auto"` |
+
+### delegate
+
+Create an ephemeral specialist and delegate a task in one call. Available when `oneshot_delegation=True`.
+
+```python
+# The agent calls:
+delegate(
+    description="Analyze this dataset and summarize key trends",
+    instructions="You are a data analyst. Return concise findings.",
+    mode="sync",
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `description` | `str` | Task prompt for the specialist |
+| `instructions` | `str` | Specialist system prompt |
+| `model` | `str \| None` | Optional model override |
+| `capabilities` | `list[str] \| None` | Optional capability names |
+| `can_ask_questions` | `bool` | Whether the specialist can ask the parent |
+| `mode` | `str` | `"sync"`, `"async"`, or `"auto"` |
+
+The specialist is not registered and cannot be reused by name.
 
 ### check_task
 

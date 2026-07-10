@@ -325,6 +325,44 @@ create_agent_factory_toolset(
 
 After reaching the limit, creating new agents will fail until existing ones are removed.
 
+## One-Shot Delegation
+
+For one-off specialists, enable `oneshot_delegation=True` on the subagent toolset (or `SubAgentCapability`). This exposes a `delegate` tool that combines agent creation and task execution in a single call.
+
+```python
+from subagents_pydantic_ai import create_subagent_toolset
+
+toolset = create_subagent_toolset(
+    oneshot_delegation=True,
+    allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
+    capabilities_map={
+        "filesystem": lambda deps: [create_fs_toolset(deps.backend)],
+    },
+)
+```
+
+### `delegate` Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `description` | `str` | Task prompt for the specialist |
+| `instructions` | `str` | Specialist system prompt |
+| `model` | `str \| None` | Optional model override |
+| `capabilities` | `list[str] \| None` | Optional capability names |
+| `can_ask_questions` | `bool` | Whether the specialist can ask the parent (default: `True`) |
+| `mode` | `str` | `"sync"`, `"async"`, or `"auto"` (default: `"sync"`) |
+
+### Registry Semantics
+
+One-shot specialists are **ephemeral**:
+
+- They are **not** registered in `DynamicAgentRegistry`
+- They do **not** count toward `max_agents`
+- They cannot be reused via `task(subagent_type=...)`
+- An internal name like `oneshot-{task_id}` is generated for logging and async task handles
+
+Use `delegate` for ad-hoc specialists. Use `create_agent` + `task` when you need a reusable agent that persists in the registry.
+
 ### Naming Conflicts
 
 Dynamic agents cannot override pre-configured agents:

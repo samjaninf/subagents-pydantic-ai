@@ -66,7 +66,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.return_value = MagicMock()
             result = await create_tool.function(
                 ctx,
@@ -112,7 +112,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.return_value = MagicMock()
 
             # Create first agent
@@ -178,7 +178,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent = MagicMock()
             mock_agent_class.return_value = mock_agent
 
@@ -236,7 +236,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent = MagicMock()
             mock_agent_class.return_value = mock_agent
 
@@ -273,7 +273,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.return_value = MagicMock()
 
             await create_tool.function(
@@ -304,7 +304,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.return_value = MagicMock()
 
             # Create agent
@@ -342,7 +342,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.return_value = MagicMock()
 
             # Create agent
@@ -383,7 +383,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.return_value = MagicMock()
 
             # Create agent with long instructions
@@ -411,7 +411,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.return_value = MagicMock()
 
             # Create first agent
@@ -441,7 +441,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.side_effect = ValueError("Invalid configuration")
 
             result = await create_tool.function(
@@ -462,7 +462,7 @@ class TestCreateAgentFactoryToolset:
 
         ctx = MockRunContext(deps=MockDeps())
 
-        with patch("subagents_pydantic_ai.factory.Agent") as mock_agent_class:
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.side_effect = RuntimeError("Something went wrong")
 
             result = await create_tool.function(

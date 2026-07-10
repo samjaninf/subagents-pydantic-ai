@@ -50,6 +50,34 @@ DEFAULT_GENERAL_PURPOSE_DESCRIPTION = """A general-purpose agent for a wide vari
 Use this when no specialized subagent matches the task requirements.
 Capable of research, analysis, writing, and problem-solving."""
 
+DELEGATE_TOOL_DESCRIPTION = """\
+Create an ephemeral specialist and delegate a task to it in a single call.
+
+Use this instead of `create_agent` + `task` when you need a one-off specialist \
+for a single job. The specialist is not registered and cannot be reused by name.
+
+## When to use
+- One-off tasks that need custom instructions or capabilities
+- Ad-hoc specialists you will not delegate to again
+- Quick delegation without polluting the agent registry
+
+## When NOT to use
+- Reusable specialists you will delegate to multiple times — use `task` with a \
+configured subagent or create a persistent agent first
+- Trivial tasks you can do faster yourself
+
+## Parameters
+- **description**: The task prompt for the specialist to execute
+- **instructions**: The specialist's system prompt / role definition
+- **model**: Optional model override
+- **capabilities**: Optional capability names to attach to the specialist
+- **mode**: `"sync"` (default), `"async"`, or `"auto"`
+
+Returns:
+- In sync mode: The specialist's response as a string.
+- In async mode: A task handle with task_id for status checking.
+"""
+
 TASK_TOOL_DESCRIPTION = """\
 Delegate a task to a specialized subagent. The subagent runs independently \
 with its own context and tools, and returns a result when done.

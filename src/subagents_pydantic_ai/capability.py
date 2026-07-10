@@ -71,6 +71,12 @@ class SubAgentCapability(AbstractCapability[Any]):
         descriptions: Custom tool descriptions override.
         usage_limits: Optional static or per-task usage limits for delegated
             subagent runs.
+        oneshot_delegation: When True, expose a `delegate` tool for ephemeral
+            create-and-run delegation.
+        allowed_models: Optional model allow-list for one-shot specialists.
+        capabilities_map: Optional capability factories for one-shot specialists.
+        default_agent_factory: Optional custom agent factory for one-shot
+            specialists.
     """
 
     subagents: list[SubAgentConfig] | None = None
@@ -81,6 +87,10 @@ class SubAgentCapability(AbstractCapability[Any]):
     registry: Any = None
     descriptions: dict[str, str] | None = None
     usage_limits: UsageLimits | UsageLimitsFactory | None = None
+    oneshot_delegation: bool = False
+    allowed_models: list[str] | None = None
+    capabilities_map: dict[str, Any] | None = None
+    default_agent_factory: Any | None = None
     _toolset: AbstractToolset[Any] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -95,6 +105,10 @@ class SubAgentCapability(AbstractCapability[Any]):
             registry=self.registry,
             descriptions=self.descriptions,
             usage_limits=self.usage_limits,
+            oneshot_delegation=self.oneshot_delegation,
+            allowed_models=self.allowed_models,
+            capabilities_map=self.capabilities_map,
+            default_agent_factory=self.default_agent_factory,
         )
 
     @classmethod

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **One-shot delegation via `delegate` tool.** Opt in with `oneshot_delegation=True` on `create_subagent_toolset` or `SubAgentCapability`. The new `delegate` tool creates an ephemeral specialist and runs its task in one call, bypassing the dynamic agent registry. Shared dynamic-agent validation and construction logic was extracted into `dynamic_agent.py` and reused by `create_agent_factory_toolset`.
+
 ## [0.2.8] - 2026-06-26
 
 ### Fixed

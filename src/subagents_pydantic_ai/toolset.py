@@ -16,11 +16,13 @@ from pydantic_ai import Agent, RunContext, UsageLimits
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import FunctionToolset
 
+from subagents_pydantic_ai.dynamic_agent import CapabilityFactory, build_dynamic_agent
 from subagents_pydantic_ai.message_bus import InMemoryMessageBus, TaskManager
 from subagents_pydantic_ai.prompts import (
     ANSWER_SUBAGENT_DESCRIPTION,
     CHECK_TASK_DESCRIPTION,
     DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
+    DELEGATE_TOOL_DESCRIPTION,
     HARD_CANCEL_TASK_DESCRIPTION,
     LIST_ACTIVE_TASKS_DESCRIPTION,
     SEND_MESSAGE_TO_SUBAGENT_DESCRIPTION,
@@ -235,6 +237,84 @@ def _create_ask_parent_toolset() -> FunctionToolset[Any]:
     return toolset
 
 
+async def _execute_compiled_subagent(
+    ctx: RunContext[SubAgentDepsProtocol],
+    subagent: CompiledSubAgent,
+    description: str,
+    *,
+    mode: ExecutionMode,
+    priority: TaskPriority,
+    complexity: Literal["simple", "moderate", "complex"] | None,
+    requires_user_context: bool,
+    may_need_clarification: bool,
+    max_nesting_depth: int,
+    toolsets_factory: ToolsetFactory | None,
+    ask_user: AskUserCallback | None,
+    usage_limits: UsageLimits | UsageLimitsFactory | None,
+    task_manager: TaskManager,
+    message_bus: InMemoryMessageBus,
+    inject_ask_parent: bool = False,
+    task_id: str | None = None,
+) -> str:
+    """Run a compiled subagent synchronously or asynchronously."""
+    config = subagent.config
+    agent = subagent.agent
+
+    if agent is None:
+        return f"Error: Subagent '{subagent.name}' is not properly initialized"
+
+    resolved_usage_limits = usage_limits(ctx, config) if callable(usage_limits) else usage_limits
+
+    parent_deps = ctx.deps
+    subagent_deps = parent_deps.clone_for_subagent(max_nesting_depth - 1)
+
+    runtime_toolsets: list[Any] | None = None
+    if toolsets_factory or inject_ask_parent:
+        runtime_toolsets = []
+        if inject_ask_parent and config.get("can_ask_questions", True):
+            runtime_toolsets.append(_create_ask_parent_toolset())
+        if toolsets_factory:
+            runtime_toolsets.extend(toolsets_factory(subagent_deps))
+
+    actual_task_id = task_id or str(uuid.uuid4())[:8]
+
+    if mode == "auto":
+        characteristics = TaskCharacteristics(
+            estimated_complexity=complexity or config.get("typical_complexity", "moderate"),
+            requires_user_context=requires_user_context
+            or config.get("typically_needs_context", False),
+            may_need_clarification=may_need_clarification,
+        )
+        resolved_mode = decide_execution_mode(characteristics, config)
+    else:
+        resolved_mode = mode
+
+    if resolved_mode == "sync":
+        return await _run_sync(
+            agent=agent,
+            config=config,
+            description=description,
+            deps=subagent_deps,
+            task_id=actual_task_id,
+            extra_toolsets=runtime_toolsets,
+            ask_user=ask_user,
+            usage_limits=resolved_usage_limits,
+        )
+
+    return await _run_async(
+        agent=agent,
+        config=config,
+        description=description,
+        deps=subagent_deps,
+        task_id=actual_task_id,
+        task_manager=task_manager,
+        message_bus=message_bus,
+        extra_toolsets=runtime_toolsets,
+        priority=priority,
+        usage_limits=resolved_usage_limits,
+    )
+
+
 def create_subagent_toolset(  # noqa: C901
     subagents: list[SubAgentConfig] | None = None,
     default_model: str | Model = "openai:gpt-4.1",
@@ -246,12 +326,18 @@ def create_subagent_toolset(  # noqa: C901
     descriptions: dict[str, str] | None = None,
     ask_user: AskUserCallback | None = None,
     usage_limits: UsageLimits | UsageLimitsFactory | None = None,
+    oneshot_delegation: bool = False,
+    allowed_models: list[str] | None = None,
+    capabilities_map: dict[str, CapabilityFactory] | None = None,
+    default_agent_factory: Any | None = None,
 ) -> FunctionToolset[Any]:
     """Create a toolset for delegating tasks to subagents.
 
     This is the main entry point for using the subagent system. It creates
     a toolset with tools for:
     - `task`: Delegate a task to a subagent (sync or async)
+    - `delegate`: Create and run an ephemeral specialist in one call (when
+      `oneshot_delegation=True`)
     - `check_task`: Check status of an async task
     - `answer_subagent`: Answer a question from a subagent
     - `list_active_tasks`: List all running background tasks
@@ -285,6 +371,13 @@ def create_subagent_toolset(  # noqa: C901
             context and selected subagent config. A factory may return `None`
             to run that task without explicit limits. Limits are honoured on
             every retry attempt as well.
+        oneshot_delegation: When True, expose a `delegate` tool that creates an
+            ephemeral specialist and runs its task in one call. The specialist
+            is not registered in the dynamic agent registry.
+        allowed_models: Optional model allow-list for one-shot specialists.
+        capabilities_map: Optional capability factories for one-shot specialists.
+        default_agent_factory: Optional custom agent factory for one-shot
+            specialists. When set, `capabilities` on `delegate` are rejected.
 
     Returns:
         FunctionToolset configured with subagent management tools.
@@ -361,12 +454,14 @@ def create_subagent_toolset(  # noqa: C901
         # Validate subagent_type — check static compiled dict first, then dynamic registry
         if subagent_type in compiled:
             subagent = compiled[subagent_type]
+            inject_ask_parent = False
         elif (
             registry is not None
             and hasattr(registry, "get_compiled")
             and registry.get_compiled(subagent_type)
         ):
             subagent = registry.get_compiled(subagent_type)
+            inject_ask_parent = True
         else:
             # Build available list from both sources
             available_names = list(compiled.keys())
@@ -375,61 +470,104 @@ def create_subagent_toolset(  # noqa: C901
             available = ", ".join(available_names)
             return f"Error: Unknown subagent '{subagent_type}'. Available: {available}"
 
-        config = subagent.config
-        agent = subagent.agent
-
-        if agent is None:
-            return f"Error: Subagent '{subagent_type}' is not properly initialized"
-
-        resolved_usage_limits = (
-            usage_limits(ctx, config) if callable(usage_limits) else usage_limits
+        return await _execute_compiled_subagent(
+            ctx,
+            subagent,
+            description,
+            mode=mode,
+            priority=priority,
+            complexity=complexity,
+            requires_user_context=requires_user_context,
+            may_need_clarification=may_need_clarification,
+            max_nesting_depth=max_nesting_depth,
+            toolsets_factory=toolsets_factory,
+            ask_user=ask_user,
+            usage_limits=usage_limits,
+            task_manager=task_manager,
+            message_bus=message_bus,
+            inject_ask_parent=inject_ask_parent,
         )
 
-        # Create deps for subagent
-        parent_deps = ctx.deps
-        subagent_deps = parent_deps.clone_for_subagent(max_nesting_depth - 1)
+    if oneshot_delegation:
+        models_desc = (
+            f"Allowed models: {', '.join(allowed_models)}"
+            if allowed_models
+            else "Any model is allowed"
+        )
+        caps_desc = (
+            f"Available capabilities: {', '.join(capabilities_map.keys())}"
+            if capabilities_map
+            else "No predefined capabilities available"
+        )
+        delegate_description = _descs.get(
+            "delegate",
+            DELEGATE_TOOL_DESCRIPTION.rstrip()
+            + f"\n\n{models_desc}\n{caps_desc}\n\n"
+            + f"Default model when none is given: {default_model}.",
+        )
 
-        # Build runtime toolsets from factory if provided
-        runtime_toolsets = toolsets_factory(subagent_deps) if toolsets_factory else None
+        @toolset.tool(description=delegate_description)
+        async def delegate(
+            ctx: RunContext[SubAgentDepsProtocol],
+            description: str,
+            instructions: str,
+            model: str | None = None,
+            capabilities: list[str] | None = None,
+            can_ask_questions: bool = True,
+            mode: ExecutionMode = "sync",
+            priority: TaskPriority = TaskPriority.NORMAL,
+            complexity: Literal["simple", "moderate", "complex"] | None = None,
+            requires_user_context: bool = False,
+            may_need_clarification: bool = False,
+        ) -> str:
+            """Create an ephemeral specialist and delegate a task in one call."""
+            task_id = str(uuid.uuid4())[:8]
+            agent_name = f"oneshot-{task_id}"
+            agent_description = description[:120] or "Ephemeral specialist"
+            actual_model = model or default_model
 
-        # Generate task ID
-        task_id = str(uuid.uuid4())[:8]
+            agent, config, error = build_dynamic_agent(
+                ctx,
+                name=agent_name,
+                description=agent_description,
+                instructions=instructions,
+                model=actual_model,
+                can_ask_questions=can_ask_questions,
+                capabilities=capabilities,
+                allowed_models=allowed_models,
+                toolsets_factory=None,
+                capabilities_map=capabilities_map,
+                default_agent_factory=default_agent_factory,
+            )
+            if error is not None:
+                return error
+            if config is None or agent is None:
+                return "Error creating agent"
 
-        # Resolve mode if "auto"
-        if mode == "auto":
-            characteristics = TaskCharacteristics(
-                estimated_complexity=complexity or config.get("typical_complexity", "moderate"),
-                requires_user_context=requires_user_context
-                or config.get("typically_needs_context", False),
+            subagent = CompiledSubAgent(
+                name=agent_name,
+                description=agent_description,
+                agent=agent,
+                config=config,
+            )
+
+            return await _execute_compiled_subagent(
+                ctx,
+                subagent,
+                description,
+                mode=mode,
+                priority=priority,
+                complexity=complexity,
+                requires_user_context=requires_user_context,
                 may_need_clarification=may_need_clarification,
-            )
-            resolved_mode = decide_execution_mode(characteristics, config)
-        else:
-            resolved_mode = mode
-
-        if resolved_mode == "sync":
-            return await _run_sync(
-                agent=agent,
-                config=config,
-                description=description,
-                deps=subagent_deps,
-                task_id=task_id,
-                extra_toolsets=runtime_toolsets,
+                max_nesting_depth=max_nesting_depth,
+                toolsets_factory=toolsets_factory,
                 ask_user=ask_user,
-                usage_limits=resolved_usage_limits,
-            )
-        else:
-            return await _run_async(
-                agent=agent,
-                config=config,
-                description=description,
-                deps=subagent_deps,
-                task_id=task_id,
+                usage_limits=usage_limits,
                 task_manager=task_manager,
                 message_bus=message_bus,
-                extra_toolsets=runtime_toolsets,
-                priority=priority,
-                usage_limits=resolved_usage_limits,
+                inject_ask_parent=True,
+                task_id=task_id,
             )
 
     @toolset.tool(description=_descs.get("check_task", CHECK_TASK_DESCRIPTION))
