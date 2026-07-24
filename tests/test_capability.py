@@ -105,6 +105,22 @@ class TestSubAgentCapability:
         assert cap.usage_limits is usage_limits
         assert create_toolset.call_args.kwargs["usage_limits"] is usage_limits
 
+    def test_max_result_chars_defaults_to_2000(self):
+        """The result preview budget defaults to 2000 characters."""
+        with patch("subagents_pydantic_ai.capability.create_subagent_toolset") as create_toolset:
+            cap = _cap()
+
+        assert cap.max_result_chars == 2000
+        assert create_toolset.call_args.kwargs["max_result_chars"] == 2000
+
+    def test_max_result_chars_forwarded_to_toolset(self):
+        """max_result_chars is forwarded to the underlying toolset factory."""
+        with patch("subagents_pydantic_ai.capability.create_subagent_toolset") as create_toolset:
+            cap = _cap(max_result_chars=None)
+
+        assert cap.max_result_chars is None
+        assert create_toolset.call_args.kwargs["max_result_chars"] is None
+
 
 class TestSubAgentCapabilityIntegration:
     """Integration tests with real Agent."""

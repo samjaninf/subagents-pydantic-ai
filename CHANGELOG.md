@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`wait_tasks` truncated results silently, making orchestrators re-delegate finished work** ([#55](https://github.com/vstorm-co/subagents-pydantic-ai/issues/55)). A completed task's result was hard-sliced to 2000 characters with no ellipsis, length, or marker of any kind. The orchestrator saw a well-formed answer that stopped mid-sentence, concluded the subagent had been cut off, and dispatched a *new* task asking it to finish — burning a full extra round-trip on work that was already complete and stored intact. Truncated results now end with an explicit marker stating that the cut is a display limit, that the stored answer is complete, and which `check_task(...)` call returns the full text; `check_task` and the `wait_tasks` tool description say the same, so the orchestrator knows the rule before it ever meets a cut result.
+
+### Added
+
+- **`max_result_chars` on `create_subagent_toolset` and `SubAgentCapability`** (default `2000`, matching the previous hard-coded limit). Sets the per-result character budget in the `wait_tasks` listing, so a fan-out of verbose subagents can't flood the orchestrator's context. Pass `None` to never truncate; a negative value raises `ValueError`.
+
 ## [0.2.9] - 2026-07-19
 
 ### Added

@@ -3922,3 +3922,138 @@ class TestObservabilityHelpers:
         assert handle.traceparent == "00-abc"
         assert handle.trace_id is None
         assert handle.span_id is None
+
+
+class TestPreviewResult:
+    """Tests for the _preview_result helper backing wait_tasks previews."""
+
+    def test_short_result_is_unchanged(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        assert _preview_result("short answer", "abc123", 2000) == "short answer"
+
+    def test_result_at_budget_is_not_truncated(self):
+        """A result exactly at the budget is complete, so it gets no marker."""
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        result = "x" * 100
+        assert _preview_result(result, "abc123", 100) == result
+
+    def test_result_one_char_over_budget_is_truncated(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        preview = _preview_result("x" * 101, "abc123", 100)
+        assert preview.startswith("x" * 100)
+        assert "x" * 101 not in preview
+        assert "showing 100 of 101 characters" in preview
+
+    def test_marker_points_at_check_task_with_the_task_id(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        preview = _preview_result("y" * 50, "task-42", 10)
+        assert "Result truncated for display" in preview
+        assert "check_task('task-42')" in preview
+        assert "The subagent's answer is complete" in preview
+
+    def test_none_budget_never_truncates(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        result = "z" * 10_000
+        assert _preview_result(result, "abc123", None) == result
+
+    def test_zero_budget_yields_marker_only(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        preview = _preview_result("hidden", "abc123", 0)
+        assert preview.startswith("\n\n[Result truncated for display")
+        assert "hidden" not in preview
+
+    def test_empty_result_is_unchanged(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        assert _preview_result("", "abc123", 2000) == ""
+
+
+class TestWaitTasksResultTruncation:
+    """wait_tasks must never hand the orchestrator a silently cut result."""
+
+    @staticmethod
+    def _toolset_with_result(result: str, /, **kwargs: Any) -> tuple[Any, Any]:
+        toolset = create_subagent_toolset(default_model="test", **kwargs)
+        tm = toolset.task_manager  # type: ignore[attr-defined]
+        tm.handles["long-task"] = TaskHandle(
+            task_id="long-task",
+            subagent_name="worker",
+            description="verbose task",
+            status=TaskStatus.COMPLETED,
+            result=result,
+        )
+        return toolset, tm
+
+    @pytest.mark.anyio
+    async def test_truncated_result_carries_a_marker(self):
+        toolset, _ = self._toolset_with_result("a" * 2500)
+
+        wait_tool = toolset.tools["wait_tasks"]
+        output = await wait_tool.function(MockRunContext(deps=MockDeps()), ["long-task"])
+
+        assert "COMPLETED" in output
+        assert "showing 2000 of 2500 characters" in output
+        assert "check_task('long-task')" in output
+
+    @pytest.mark.anyio
+    async def test_result_within_budget_has_no_marker(self):
+        toolset, _ = self._toolset_with_result("complete answer")
+
+        wait_tool = toolset.tools["wait_tasks"]
+        output = await wait_tool.function(MockRunContext(deps=MockDeps()), ["long-task"])
+
+        assert "complete answer" in output
+        assert "truncated" not in output
+
+    @pytest.mark.anyio
+    async def test_custom_budget_is_honoured(self):
+        toolset, _ = self._toolset_with_result("b" * 100, max_result_chars=10)
+
+        wait_tool = toolset.tools["wait_tasks"]
+        output = await wait_tool.function(MockRunContext(deps=MockDeps()), ["long-task"])
+
+        assert "showing 10 of 100 characters" in output
+        assert "b" * 11 not in output
+
+    @pytest.mark.anyio
+    async def test_none_budget_returns_the_full_result(self):
+        toolset, _ = self._toolset_with_result("c" * 5000, max_result_chars=None)
+
+        wait_tool = toolset.tools["wait_tasks"]
+        output = await wait_tool.function(MockRunContext(deps=MockDeps()), ["long-task"])
+
+        assert "c" * 5000 in output
+        assert "truncated" not in output
+
+    @pytest.mark.anyio
+    async def test_truncation_keeps_the_chat_trace_line_intact(self):
+        """The trace id stays above the preview so continuation still parses."""
+        toolset, tm = self._toolset_with_result("d" * 2500)
+        tm.handles["long-task"].chat_trace_id = "trace-9"
+
+        wait_tool = toolset.tools["wait_tasks"]
+        output = await wait_tool.function(MockRunContext(deps=MockDeps()), ["long-task"])
+
+        assert "Chat Trace ID: trace-9\nddd" in output
+        assert "showing 2000 of 2500 characters" in output
+
+    @pytest.mark.anyio
+    async def test_check_task_returns_the_untruncated_result(self):
+        """check_task is the escape hatch the truncation marker points at."""
+        toolset, _ = self._toolset_with_result("e" * 2500)
+
+        check_tool = toolset.tools["check_task"]
+        output = await check_tool.function(MockRunContext(deps=MockDeps()), "long-task")
+
+        assert "e" * 2500 in output
+        assert "truncated" not in output
+
+    def test_negative_budget_is_rejected(self):
+        with pytest.raises(ValueError, match="max_result_chars must be >= 0 or None, got -1"):
+            create_subagent_toolset(default_model="test", max_result_chars=-1)

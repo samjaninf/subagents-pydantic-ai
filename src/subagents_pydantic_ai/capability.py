@@ -71,6 +71,10 @@ class SubAgentCapability(AbstractCapability[Any]):
         descriptions: Custom tool descriptions override.
         usage_limits: Optional static or per-task usage limits for delegated
             subagent runs.
+        max_result_chars: Character budget for a completed task's result in the
+            `wait_tasks` listing. Truncated results carry an explicit marker
+            pointing at `check_task`, which always returns the full text. Pass
+            `None` to never truncate.
     """
 
     subagents: list[SubAgentConfig] | None = None
@@ -81,6 +85,7 @@ class SubAgentCapability(AbstractCapability[Any]):
     registry: Any = None
     descriptions: dict[str, str] | None = None
     usage_limits: UsageLimits | UsageLimitsFactory | None = None
+    max_result_chars: int | None = 2000
     _toolset: AbstractToolset[Any] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -95,6 +100,7 @@ class SubAgentCapability(AbstractCapability[Any]):
             registry=self.registry,
             descriptions=self.descriptions,
             usage_limits=self.usage_limits,
+            max_result_chars=self.max_result_chars,
         )
 
     @classmethod
