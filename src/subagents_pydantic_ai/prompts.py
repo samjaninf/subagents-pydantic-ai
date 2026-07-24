@@ -102,7 +102,8 @@ Check the status of a background (async) task and get its result if completed.
 
 Use this after launching async tasks to see if they're done. Returns the \
 task status (running, completed, failed, waiting_for_answer) and the result \
-if available."""
+if available. The result is always returned in full, so call this when a \
+`wait_tasks` listing showed a truncated one."""
 
 ANSWER_SUBAGENT_DESCRIPTION = """\
 Answer a question from a background subagent that is waiting for clarification.
@@ -144,7 +145,13 @@ faster than waiting on the slowest agent.
 The result lists every requested task with its current state and a header \
 showing `mode`, `<finished>/<total> finished`, and how many are still \
 running. Unfinished tasks remain in the background — you can keep working \
-or wait on them again later."""
+or wait on them again later.
+
+A long result may be cut here to save context, in which case it ends with an \
+explicit truncation marker. That marker is a display limit on this listing, \
+never an incomplete subagent answer: the full text is stored and \
+`check_task` returns it. Never re-delegate a task to "finish" a result that \
+carries the marker."""
 
 SEND_MESSAGE_TO_SUBAGENT_DESCRIPTION = """\
 Send a steering message to a running background (async) subagent without \

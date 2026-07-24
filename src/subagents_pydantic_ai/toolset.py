@@ -188,6 +188,33 @@ def _format_chat_trace_result(output: str, chat_trace_id: str) -> str:
     return f"{output}\n\nChat Trace ID: {chat_trace_id}"
 
 
+def _preview_result(result: str, task_id: str, max_chars: int | None) -> str:
+    """Render a task result for `wait_tasks`, marking truncation explicitly.
+
+    A silent cut reads to the orchestrator like a subagent that stopped
+    mid-sentence, so it "recovers" by re-delegating the same work. The marker
+    states that the cut is ours, that the stored answer is complete, and which
+    tool returns the untruncated text.
+
+    Args:
+        result: The subagent's full result text.
+        task_id: Task ID the orchestrator passes to `check_task` for the rest.
+        max_chars: Preview budget in characters; `None` disables truncation.
+
+    Returns:
+        The result unchanged when it fits the budget, otherwise the first
+        `max_chars` characters followed by the truncation marker.
+    """
+    if max_chars is None or len(result) <= max_chars:
+        return result
+    return (
+        f"{result[:max_chars]}\n\n"
+        f"[Result truncated for display: showing {max_chars} of {len(result)} characters. "
+        f"The subagent's answer is complete and stored in full. "
+        f"Call check_task('{task_id}') to read all of it.]"
+    )
+
+
 async def _drain_steering_messages(message_bus: InMemoryMessageBus, agent_id: str) -> list[str]:
     """Drain pending parent -> child steering messages for a running subagent.
 
@@ -370,6 +397,7 @@ def create_subagent_toolset(  # noqa: C901
     usage_limits: UsageLimits | UsageLimitsFactory | None = None,
     max_chat_traces: int = 100,
     max_task_handles: int = 500,
+    max_result_chars: int | None = 2000,
 ) -> FunctionToolset[Any]:
     """Create a toolset for delegating tasks to subagents.
 
@@ -419,9 +447,17 @@ def create_subagent_toolset(  # noqa: C901
             oldest finished handles are evicted past this limit; their token
             usage is folded into `get_total_usage()` totals so aggregates stay
             correct. Bounds memory in long-lived sessions.
+        max_result_chars: Character budget for a completed task's result in the
+            `wait_tasks` listing, keeping a fan-out of verbose subagents from
+            flooding the orchestrator's context. Results past the budget are cut
+            and carry an explicit marker pointing at `check_task`, which always
+            returns the full text. Pass `None` to never truncate.
 
     Returns:
         FunctionToolset configured with subagent management tools.
+
+    Raises:
+        ValueError: If `max_result_chars` is negative.
 
     Example:
         ```python
@@ -444,6 +480,9 @@ def create_subagent_toolset(  # noqa: C901
         agent = Agent("openai:gpt-4.1", toolsets=[toolset])
         ```
     """
+    if max_result_chars is not None and max_result_chars < 0:
+        raise ValueError(f"max_result_chars must be >= 0 or None, got {max_result_chars}")
+
     _descs = descriptions or {}
 
     # Build subagent configs
@@ -836,7 +875,7 @@ def create_subagent_toolset(  # noqa: C901
             status = handle.status
             if status == "completed":
                 finished_count += 1
-                result_preview = (handle.result or "")[:2000]
+                result_preview = _preview_result(handle.result or "", tid, max_result_chars)
                 chat_trace_line = ""
                 if handle.chat_trace_id is not None:
                     chat_trace_line = f"Chat Trace ID: {handle.chat_trace_id}\n"

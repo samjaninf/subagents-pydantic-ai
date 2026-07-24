@@ -30,6 +30,7 @@ toolset = create_subagent_toolset(subagents=subagents)
 | `descriptions` | `dict[str, str] \| None` | `None` | Override default tool descriptions by tool name |
 | `max_chat_traces` | `int` | `100` | Max subagent conversations kept for `chat_trace_id` continuation (LRU-evicted) |
 | `max_task_handles` | `int` | `500` | Max finished task handles retained for status/observability (oldest evicted; usage totals preserved) |
+| `max_result_chars` | `int \| None` | `2000` | Character budget for a result shown by `wait_tasks`; longer results are cut with an explicit marker. `None` disables truncation |
 
 ## Adding to an Agent
 
@@ -259,6 +260,25 @@ The output includes a header like
 `Task results (mode=any, 1/4 finished, 3 still running):` so the
 orchestrator can see which tasks are still in flight and decide whether
 to keep waiting or do other work first.
+
+#### Long results are truncated, and say so
+
+A fan-out of verbose subagents can flood the orchestrator's context, so
+`wait_tasks` shows at most `max_result_chars` (default 2000) of each result.
+A cut result always ends with an explicit marker:
+
+```text
+...the last of the 2000 shown characters
+
+[Result truncated for display: showing 2000 of 5231 characters. The subagent's
+answer is complete and stored in full. Call check_task('abc123') to read all of it.]
+```
+
+The marker matters as much as the limit. Without it an orchestrator reads a
+result that stops mid-sentence, concludes the subagent failed to finish, and
+delegates the same work again — a wasted round-trip caused entirely by the
+display limit. `check_task` always returns the untruncated result, and passing
+`max_result_chars=None` to `create_subagent_toolset` turns truncation off.
 
 ### soft_cancel_task
 
