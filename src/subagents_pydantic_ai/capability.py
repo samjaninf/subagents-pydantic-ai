@@ -32,6 +32,7 @@ from pydantic_ai import RunContext, UsageLimits
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.toolsets import AbstractToolset
 
+from subagents_pydantic_ai.dynamic_agent import CapabilityFactory
 from subagents_pydantic_ai.prompts import get_subagent_system_prompt
 from subagents_pydantic_ai.toolset import create_subagent_toolset
 from subagents_pydantic_ai.types import (
@@ -76,11 +77,13 @@ class SubAgentCapability(AbstractCapability[Any]):
         descriptions: Custom tool descriptions override.
         usage_limits: Optional static or per-task usage limits for delegated
             subagent runs.
-        delegation_configuration: Select persisted, combined, or one-shot-only
-            delegation entry points.
+        delegation_configuration: Select default, persisted, combined, or
+            one-shot-only delegation entry points.
         allowed_models: Optional model allow-list for dynamic specialists.
         capabilities_map: Optional capability factories for dynamic specialists.
         default_agent_factory: Optional custom agent factory for dynamic specialists.
+            Do not attach an `ask_parent` toolset in the factory; the toolset
+            injects it at run time when needed.
         max_agents: Maximum number of persistent dynamic agents.
     """
 
@@ -94,7 +97,7 @@ class SubAgentCapability(AbstractCapability[Any]):
     usage_limits: UsageLimits | UsageLimitsFactory | None = None
     delegation_configuration: DelegationConfiguration = "default"
     allowed_models: list[str] | None = None
-    capabilities_map: dict[str, Any] | None = None
+    capabilities_map: dict[str, CapabilityFactory] | None = None
     default_agent_factory: Any | None = None
     max_agents: int = 10
     _toolset: AbstractToolset[Any] | None = field(default=None, init=False, repr=False)

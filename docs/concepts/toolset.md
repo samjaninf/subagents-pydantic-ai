@@ -29,7 +29,7 @@ toolset = create_subagent_toolset(subagents=subagents)
 | `max_nesting_depth` | `int` | `0` | Maximum subagent nesting depth |
 | `registry` | `DynamicAgentRegistry \| None` | `None` | Registry for dynamically created agents |
 | `descriptions` | `dict[str, str] \| None` | `None` | Override default tool descriptions by tool name |
-| `delegation_configuration` | `DelegationConfiguration` | `"default"` | Controls whether persistent, one-shot, or both entry points are exposed |
+| `delegation_configuration` | `DelegationConfiguration` | `"default"` | Controls whether task-only, persisted, one-shot, or combined entry points are exposed |
 | `allowed_models` | `list[str] \| None` | `None` | Model allow-list for dynamic specialists |
 | `capabilities_map` | `dict[str, Callable] \| None` | `None` | Capability factories for dynamic specialists |
 | `default_agent_factory` | `Callable \| None` | `None` | Custom agent factory for dynamic specialists |
@@ -98,7 +98,8 @@ The toolset provides these tools to your agent:
 
 | Mode | Entry-point tools |
 |------|-------------------|
-| `"default"` | `create_agent`, `task` |
+| `"default"` | `task` |
+| `"persisted"` | `create_agent`, `task` |
 | `"persisted_and_oneshot"` | `create_agent`, `task`, `delegate` |
 | `"oneshot_only"` | `delegate` |
 

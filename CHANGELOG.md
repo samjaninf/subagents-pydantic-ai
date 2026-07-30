@@ -9,7 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Configurable persistent and one-shot delegation.** `delegation_configuration` on `create_subagent_toolset` and `SubAgentCapability` selects `"default"` (`create_agent` + `task`), `"persisted_and_oneshot"` (also `delegate`), or `"oneshot_only"` (`delegate` only). The ephemeral `delegate` path bypasses the registry, while `create_agent` stores reusable specialists for later `task` calls. Shared dynamic-agent validation and construction logic lives in `dynamic_agent.py`.
+- **Configurable persistent and one-shot delegation.** `delegation_configuration` on `create_subagent_toolset` and `SubAgentCapability` selects:
+  - `"default"`: `task` only (backward-compatible)
+  - `"persisted"`: `create_agent` + `task`
+  - `"persisted_and_oneshot"`: `create_agent` + `task` + `delegate`
+  - `"oneshot_only"`: `delegate` only
+  The ephemeral `delegate` path bypasses the registry, while `create_agent` stores reusable specialists for later `task` calls. Shared dynamic-agent validation and construction logic lives in `dynamic_agent.py`.
+
+### Fixed
+
+- **Registry-backed agents now receive `ask_parent` at run time.** Dynamic agents created via the registry previously lacked the `ask_parent` toolset that statically compiled subagents get, so `can_ask_questions` was effectively a no-op for them. The toolset now injects `ask_parent` when executing registry-backed (and one-shot) agents. Custom `default_agent_factory` implementations should not attach their own `ask_parent` toolset, or the tool name will be duplicated at run time.
 
 ## [0.2.8] - 2026-06-26
 

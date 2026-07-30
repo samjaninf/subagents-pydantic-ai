@@ -110,6 +110,7 @@ from subagents_pydantic_ai import DelegationConfiguration
 
 DelegationConfiguration = Literal[
     "default",
+    "persisted",
     "persisted_and_oneshot",
     "oneshot_only",
 ]
@@ -117,7 +118,8 @@ DelegationConfiguration = Literal[
 
 | Mode | Entry-point tools |
 |------|-------------------|
-| `default` | `create_agent`, `task` |
+| `default` | `task` |
+| `persisted` | `create_agent`, `task` |
 | `persisted_and_oneshot` | `create_agent`, `task`, `delegate` |
 | `oneshot_only` | `delegate` |
 

@@ -138,7 +138,7 @@ def create_agent_factory_toolset(
             return f"Error: Agent '{name}' already exists"
 
         actual_model = model or default_model
-        agent, config, error = build_dynamic_agent(
+        result = build_dynamic_agent(
             ctx,
             name=name,
             description=description,
@@ -151,26 +151,22 @@ def create_agent_factory_toolset(
             capabilities_map=capabilities_map,
             default_agent_factory=default_agent_factory,
         )
-        if error is not None:
-            return error
-        if config is None or agent is None:
-            return "Error creating agent"
+        if isinstance(result, str):
+            return result
+        agent, config = result
 
         try:
             registry.register(config, agent)
-
-            caps_info = f"\nCapabilities: {', '.join(capabilities)}" if capabilities else ""
-            return (
-                f"Agent '{name}' created successfully.\n"
-                f"Model: {actual_model}\n"
-                f"Description: {description}{caps_info}\n"
-                f"Use task(description, '{name}') to delegate tasks."
-            )
-
         except ValueError as e:
             return f"Error: {e}"
-        except Exception as e:
-            return f"Error creating agent: {e}"
+
+        caps_info = f"\nCapabilities: {', '.join(capabilities)}" if capabilities else ""
+        return (
+            f"Agent '{name}' created successfully.\n"
+            f"Model: {actual_model}\n"
+            f"Description: {description}{caps_info}\n"
+            f"Use task(description, '{name}') to delegate tasks."
+        )
 
     @toolset.tool
     async def list_agents(

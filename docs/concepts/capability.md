@@ -50,7 +50,7 @@ SubAgentCapability(
     usage_limits=UsageLimits(           # Static limits, or a factory (see below)
         request_limit=10,
     ),
-    delegation_configuration="default", # Persistent, combined, or one-shot only
+    delegation_configuration="default", # Task-only, persisted, combined, or oneshot
     allowed_models=None,                # Model allow-list for dynamic specialists
     capabilities_map=None,              # Capability factories for dynamic specialists
     default_agent_factory=None,         # Custom agent factory for dynamic specialists
@@ -64,7 +64,8 @@ Choose which delegation entry points the capability exposes:
 
 | Mode | Entry-point tools |
 |------|-------------------|
-| `"default"` | `create_agent`, `task` |
+| `"default"` | `task` |
+| `"persisted"` | `create_agent`, `task` |
 | `"persisted_and_oneshot"` | `create_agent`, `task`, `delegate` |
 | `"oneshot_only"` | `delegate` |
 

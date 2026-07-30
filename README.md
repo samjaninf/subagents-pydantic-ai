@@ -185,6 +185,7 @@ agent = Agent(
     deps_type=Deps,
     toolsets=[create_subagent_toolset(
         registry=registry,
+        delegation_configuration="persisted",
         allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
     )],
 )
@@ -200,7 +201,8 @@ Choose which delegation entry points are exposed:
 
 | Mode | Entry-point tools |
 |------|-------------------|
-| `"default"` | `create_agent`, `task` |
+| `"default"` | `task` (backward-compatible) |
+| `"persisted"` | `create_agent`, `task` |
 | `"persisted_and_oneshot"` | `create_agent`, `task`, `delegate` |
 | `"oneshot_only"` | `delegate` |
 
@@ -225,7 +227,7 @@ toolset = create_subagent_toolset(
 # )
 ```
 
-Use `create_agent` + `task` when you need a reusable specialist. Use `delegate` for ephemeral one-off work.
+Use `"persisted"` or `"default"` with `create_agent` / `task` when you need reusable specialists. Use `delegate` for ephemeral one-off work.
 
 ## Subagent Questions
 
@@ -247,7 +249,7 @@ The parent agent can then respond using `answer_subagent(task_id, answer)`.
 
 | Tool | Description |
 |------|-------------|
-| `create_agent` | Create a reusable registry-backed specialist |
+| `create_agent` | Create a reusable registry-backed specialist (opt-in modes) |
 | `task` | Delegate a task to a subagent (sync, async, or auto) |
 | `delegate` | Create and run an ephemeral specialist in one call |
 | `check_task` | Check status and get result of a background task |

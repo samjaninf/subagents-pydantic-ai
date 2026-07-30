@@ -136,32 +136,30 @@ def build_dynamic_agent(
     toolsets_factory: ToolsetFactory | None = None,
     capabilities_map: dict[str, CapabilityFactory] | None = None,
     default_agent_factory: Any | None = None,
-) -> tuple[Any | None, SubAgentConfig | None, str | None]:
+) -> str | tuple[Any, SubAgentConfig]:
     """Validate inputs and build a dynamic agent.
 
     Returns:
-        A tuple of ``(agent, config, error_message)``. On success,
-        ``error_message`` is ``None``. On failure, ``agent`` and ``config``
-        are ``None``.
+        An error string on failure, or ``(agent, config)`` on success.
     """
     name_error = validate_agent_name(name)
     if name_error is not None:
-        return None, None, name_error
+        return name_error
 
     model_error = validate_model(model, allowed_models)
     if model_error is not None:
-        return None, None, model_error
+        return model_error
 
     caps_error = validate_capabilities(capabilities, capabilities_map)
     if caps_error is not None:
-        return None, None, caps_error
+        return caps_error
 
     factory_caps_error = validate_capabilities_with_factory(
         capabilities,
         default_agent_factory,
     )
     if factory_caps_error is not None:
-        return None, None, factory_caps_error
+        return factory_caps_error
 
     config = build_subagent_config(
         name=name,
@@ -182,8 +180,8 @@ def build_dynamic_agent(
             default_agent_factory=default_agent_factory,
         )
     except ValueError as exc:
-        return None, None, f"Error: {exc}"
+        return f"Error: {exc}"
     except Exception as exc:
-        return None, None, f"Error creating agent: {exc}"
+        return f"Error creating agent: {exc}"
 
-    return agent, config, None
+    return agent, config

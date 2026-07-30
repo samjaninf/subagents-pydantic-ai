@@ -12,7 +12,8 @@ While pre-configured subagents cover most use cases, sometimes you need to creat
 
 ## Delegation Toolset
 
-`create_subagent_toolset` exposes persistent creation and task delegation by default:
+`create_subagent_toolset` exposes `task` by default. Opt into persistent
+creation with `delegation_configuration="persisted"`:
 
 ```python
 from subagents_pydantic_ai import (
@@ -28,6 +29,7 @@ agent = Agent(
     toolsets=[create_subagent_toolset(
         subagents=base_subagents,
         registry=registry,
+        delegation_configuration="persisted",
         allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
     )],
 )
@@ -43,7 +45,7 @@ agent = Agent(
 | `max_agents` | `int` | `10` | Maximum dynamic agents |
 | `toolsets_factory` | `ToolsetFactory \| None` | `None` | Factory that builds toolsets for every new agent. Takes priority over `capabilities_map` when both are set |
 | `capabilities_map` | `dict[str, CapabilityFactory] \| None` | `None` | Maps capability names to factory functions, e.g. `{"filesystem": ..., "todo": ...}`. Used when `capabilities` are passed to `create_agent` |
-| `delegation_configuration` | `DelegationConfiguration` | `"default"` | Select persistent, combined, or one-shot-only entry points |
+| `delegation_configuration` | `DelegationConfiguration` | `"default"` | Select default, persisted, combined, or one-shot-only entry points |
 | `default_agent_factory` | `Callable \| None` | `None` | Factory used to build every dynamic agent |
 
 See [`create_subagent_toolset`][subagents_pydantic_ai.toolset.create_subagent_toolset]
@@ -326,11 +328,18 @@ After reaching the limit, creating new agents will fail until existing ones are 
 
 | Mode | Entry-point tools | Use case |
 |------|-------------------|----------|
-| `"default"` | `create_agent`, `task` | Reusable specialists |
+| `"default"` | `task` | Backward-compatible configured/registry delegation |
+| `"persisted"` | `create_agent`, `task` | Reusable specialists |
 | `"persisted_and_oneshot"` | `create_agent`, `task`, `delegate` | Reusable and ad-hoc specialists |
 | `"oneshot_only"` | `delegate` | Minimal one-shot delegation |
 
 Async lifecycle tools such as `check_task` remain available in every mode.
+`"oneshot_only"` rejects a non-empty `subagents` list at construction time,
+because those agents would be unreachable without `task`.
+
+Custom `default_agent_factory` implementations should not attach an
+`ask_parent` toolset; the toolset injects it at run time for registry-backed
+and one-shot agents.
 
 ```python
 from subagents_pydantic_ai import create_subagent_toolset

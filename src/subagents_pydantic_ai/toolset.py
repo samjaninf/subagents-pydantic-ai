@@ -338,9 +338,9 @@ def create_subagent_toolset(  # noqa: C901
 
     This is the main entry point for using the subagent system. It creates
     a toolset with tools for:
-    - `create_agent`: Create a reusable, registry-backed specialist
+    - `create_agent`: Create a reusable, registry-backed specialist (opt-in modes)
     - `task`: Delegate a task to a configured or registry-backed specialist
-    - `delegate`: Create and run an ephemeral specialist in one call
+    - `delegate`: Create and run an ephemeral specialist in one call (opt-in modes)
     - `check_task`: Check status of an async task
     - `answer_subagent`: Answer a question from a subagent
     - `list_active_tasks`: List all running background tasks
@@ -375,15 +375,20 @@ def create_subagent_toolset(  # noqa: C901
             to run that task without explicit limits. Limits are honoured on
             every retry attempt as well.
         delegation_configuration: Controls the delegation entry points:
-            `"default"` exposes `create_agent` and `task`;
+            `"default"` exposes `task` only (backward-compatible);
+            `"persisted"` exposes `create_agent` and `task`;
             `"persisted_and_oneshot"` also exposes `delegate`;
             `"oneshot_only"` exposes only `delegate`.
             Async task lifecycle tools remain available in every mode.
+            Custom factories that already attach `ask_parent` should not do so;
+            the toolset injects it at run time for registry-backed agents.
         allowed_models: Optional model allow-list for dynamically created specialists.
         capabilities_map: Optional capability factories for dynamically created
             specialists.
         default_agent_factory: Optional custom agent factory for dynamically
             created specialists. When set, requested `capabilities` are rejected.
+            Do not attach an `ask_parent` toolset in the factory; the toolset
+            injects it at run time when needed.
         max_agents: Maximum number of persistent dynamic agents.
 
     Returns:
@@ -410,12 +415,24 @@ def create_subagent_toolset(  # noqa: C901
         agent = Agent("openai:gpt-4.1", toolsets=[toolset])
         ```
     """
-    valid_configurations = {"default", "persisted_and_oneshot", "oneshot_only"}
+    valid_configurations = {
+        "default",
+        "persisted",
+        "persisted_and_oneshot",
+        "oneshot_only",
+    }
     if delegation_configuration not in valid_configurations:
         valid = ", ".join(sorted(valid_configurations))
         raise ValueError(
             f"Invalid delegation_configuration '{delegation_configuration}'. "
             f"Expected one of: {valid}"
+        )
+
+    if delegation_configuration == "oneshot_only" and subagents:
+        raise ValueError(
+            "delegation_configuration='oneshot_only' cannot be combined with "
+            "non-empty subagents; configured subagents would be unreachable. "
+            "Omit subagents, or use a mode that exposes the task tool."
         )
 
     _descs = descriptions or {}
@@ -425,7 +442,7 @@ def create_subagent_toolset(  # noqa: C901
 
     # Build subagent configs
     configs: list[SubAgentConfig] = list(subagents) if subagents else []
-    if include_general_purpose:
+    if include_general_purpose and delegation_configuration != "oneshot_only":
         configs.append(_create_general_purpose_config())
 
     # Compile subagents
@@ -455,7 +472,17 @@ def create_subagent_toolset(  # noqa: C901
         else "No predefined capabilities available"
     )
 
-    if delegation_configuration != "oneshot_only":
+    expose_create_agent = delegation_configuration in {
+        "persisted",
+        "persisted_and_oneshot",
+    }
+    expose_task = delegation_configuration != "oneshot_only"
+    expose_delegate = delegation_configuration in {
+        "persisted_and_oneshot",
+        "oneshot_only",
+    }
+
+    if expose_create_agent:
         create_agent_description = _descs.get(
             "create_agent",
             "Create a reusable specialized agent at runtime. The agent is stored "
@@ -479,7 +506,7 @@ def create_subagent_toolset(  # noqa: C901
                 return f"Error: Agent '{name}' already exists"
 
             actual_model = model or default_model
-            agent, config, error = build_dynamic_agent(
+            result = build_dynamic_agent(
                 ctx,
                 name=name,
                 description=description,
@@ -492,17 +519,14 @@ def create_subagent_toolset(  # noqa: C901
                 capabilities_map=capabilities_map,
                 default_agent_factory=default_agent_factory,
             )
-            if error is not None:
-                return error
-            if config is None or agent is None:
-                return "Error creating agent"
+            if isinstance(result, str):
+                return result
+            agent, config = result
 
             try:
                 active_registry.register(config, agent)
             except ValueError as exc:
                 return f"Error: {exc}"
-            except Exception as exc:
-                return f"Error creating agent: {exc}"
 
             caps_info = f"\nCapabilities: {', '.join(capabilities)}" if capabilities else ""
             return (
@@ -512,67 +536,63 @@ def create_subagent_toolset(  # noqa: C901
                 f"Use task(description, '{name}') to delegate tasks."
             )
 
-    @toolset.tool(description=task_description)
-    async def task(
-        ctx: RunContext[SubAgentDepsProtocol],
-        description: str,
-        subagent_type: str,
-        mode: ExecutionMode = "sync",
-        priority: TaskPriority = TaskPriority.NORMAL,
-        complexity: Literal["simple", "moderate", "complex"] | None = None,
-        requires_user_context: bool = False,
-        may_need_clarification: bool = False,
-    ) -> str:
-        """Delegate a task to a specialized subagent.
+    if expose_task:
 
-        Args:
-            ctx: The run context with dependencies.
-            description: Detailed description of the task to perform.
-            subagent_type: Name of the subagent to use.
-            mode: Execution mode - "sync" (blocking), "async" (background), or "auto".
-            priority: Task priority level (for async tasks).
-            complexity: Override complexity estimate ("simple", "moderate", "complex").
-            requires_user_context: Whether task needs ongoing user interaction.
-            may_need_clarification: Whether task might need clarifying questions.
-        """
-        # Validate subagent_type — check static compiled dict first, then dynamic registry
-        if subagent_type in compiled:
-            subagent = compiled[subagent_type]
-            inject_ask_parent = False
-        elif (
-            active_registry is not None
-            and hasattr(active_registry, "get_compiled")
-            and active_registry.get_compiled(subagent_type)
-        ):
-            subagent = active_registry.get_compiled(subagent_type)
-            inject_ask_parent = True
-        else:
-            # Build available list from both sources
-            available_names = list(compiled.keys())
-            if active_registry is not None and hasattr(active_registry, "list_agents"):
+        @toolset.tool(description=task_description)
+        async def task(
+            ctx: RunContext[SubAgentDepsProtocol],
+            description: str,
+            subagent_type: str,
+            mode: ExecutionMode = "sync",
+            priority: TaskPriority = TaskPriority.NORMAL,
+            complexity: Literal["simple", "moderate", "complex"] | None = None,
+            requires_user_context: bool = False,
+            may_need_clarification: bool = False,
+        ) -> str:
+            """Delegate a task to a specialized subagent.
+
+            Args:
+                ctx: The run context with dependencies.
+                description: Detailed description of the task to perform.
+                subagent_type: Name of the subagent to use.
+                mode: Execution mode - "sync" (blocking), "async" (background), or "auto".
+                priority: Task priority level (for async tasks).
+                complexity: Override complexity estimate ("simple", "moderate", "complex").
+                requires_user_context: Whether task needs ongoing user interaction.
+                may_need_clarification: Whether task might need clarifying questions.
+            """
+            # Validate subagent_type — check static compiled dict first, then dynamic registry
+            if subagent_type in compiled:
+                subagent = compiled[subagent_type]
+                inject_ask_parent = False
+            elif active_registry.get_compiled(subagent_type):
+                subagent = active_registry.get_compiled(subagent_type)
+                inject_ask_parent = True
+            else:
+                available_names = list(compiled.keys())
                 available_names.extend(active_registry.list_agents())
-            available = ", ".join(available_names)
-            return f"Error: Unknown subagent '{subagent_type}'. Available: {available}"
+                available = ", ".join(available_names)
+                return f"Error: Unknown subagent '{subagent_type}'. Available: {available}"
 
-        return await _execute_compiled_subagent(
-            ctx,
-            subagent,
-            description,
-            mode=mode,
-            priority=priority,
-            complexity=complexity,
-            requires_user_context=requires_user_context,
-            may_need_clarification=may_need_clarification,
-            max_nesting_depth=max_nesting_depth,
-            toolsets_factory=toolsets_factory,
-            ask_user=ask_user,
-            usage_limits=usage_limits,
-            task_manager=task_manager,
-            message_bus=message_bus,
-            inject_ask_parent=inject_ask_parent,
-        )
+            return await _execute_compiled_subagent(
+                ctx,
+                subagent,
+                description,
+                mode=mode,
+                priority=priority,
+                complexity=complexity,
+                requires_user_context=requires_user_context,
+                may_need_clarification=may_need_clarification,
+                max_nesting_depth=max_nesting_depth,
+                toolsets_factory=toolsets_factory,
+                ask_user=ask_user,
+                usage_limits=usage_limits,
+                task_manager=task_manager,
+                message_bus=message_bus,
+                inject_ask_parent=inject_ask_parent,
+            )
 
-    if delegation_configuration != "default":
+    if expose_delegate:
         delegate_description = _descs.get(
             "delegate",
             DELEGATE_TOOL_DESCRIPTION.rstrip()
@@ -600,7 +620,7 @@ def create_subagent_toolset(  # noqa: C901
             agent_description = description[:120] or "Ephemeral specialist"
             actual_model = model or default_model
 
-            agent, config, error = build_dynamic_agent(
+            result = build_dynamic_agent(
                 ctx,
                 name=agent_name,
                 description=agent_description,
@@ -613,10 +633,9 @@ def create_subagent_toolset(  # noqa: C901
                 capabilities_map=capabilities_map,
                 default_agent_factory=default_agent_factory,
             )
-            if error is not None:
-                return error
-            if config is None or agent is None:
-                return "Error creating agent"
+            if isinstance(result, str):
+                return result
+            agent, config = result
 
             subagent = CompiledSubAgent(
                 name=agent_name,
@@ -898,9 +917,6 @@ def create_subagent_toolset(  # noqa: C901
         return totals
 
     toolset.get_total_usage = get_total_usage  # type: ignore[attr-defined]
-
-    if delegation_configuration == "oneshot_only":
-        toolset.tools.pop("task")
 
     return toolset
 

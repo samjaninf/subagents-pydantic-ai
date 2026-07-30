@@ -42,7 +42,7 @@ class TestDynamicAgentValidation:
         assert validate_model("anthropic:claude", ["openai:gpt-4"]) is not None
 
     def test_validate_capabilities(self):
-        caps_map = {"filesystem": lambda deps: []}
+        caps_map: dict[str, Any] = {"filesystem": lambda deps: []}
         assert validate_capabilities(["filesystem"], caps_map) is None
         assert validate_capabilities(["missing"], caps_map) is not None
 
@@ -57,7 +57,7 @@ class TestBuildDynamicAgent:
         ctx = MockRunContext(deps=MockDeps())
         with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.return_value = MagicMock()
-            agent, config, error = build_dynamic_agent(
+            result = build_dynamic_agent(
                 ctx,
                 name="test-agent",
                 description="Test agent",
@@ -65,15 +65,15 @@ class TestBuildDynamicAgent:
                 model="openai:gpt-4.1",
             )
 
-        assert error is None
+        assert not isinstance(result, str)
+        agent, config = result
         assert agent is not None
-        assert config is not None
         assert config["name"] == "test-agent"
 
     @pytest.mark.asyncio
     async def test_build_disallowed_model(self):
         ctx = MockRunContext(deps=MockDeps())
-        agent, config, error = build_dynamic_agent(
+        result = build_dynamic_agent(
             ctx,
             name="test-agent",
             description="Test agent",
@@ -82,10 +82,8 @@ class TestBuildDynamicAgent:
             allowed_models=["openai:gpt-4.1"],
         )
 
-        assert agent is None
-        assert config is None
-        assert error is not None
-        assert "not allowed" in error
+        assert isinstance(result, str)
+        assert "not allowed" in result
 
     @pytest.mark.asyncio
     async def test_build_with_capabilities(self):
@@ -97,7 +95,7 @@ class TestBuildDynamicAgent:
 
         with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.return_value = MagicMock()
-            agent, config, error = build_dynamic_agent(
+            result = build_dynamic_agent(
                 ctx,
                 name="test-agent",
                 description="Test agent",
@@ -107,7 +105,8 @@ class TestBuildDynamicAgent:
                 capabilities_map={"filesystem": mock_capability_factory},
             )
 
-        assert error is None
+        assert not isinstance(result, str)
+        agent, _config = result
         assert agent is not None
         mock_agent_class.assert_called_once()
         assert mock_agent_class.call_args.kwargs.get("toolsets") is not None
@@ -117,7 +116,7 @@ class TestBuildDynamicAgent:
         ctx = MockRunContext(deps=MockDeps())
         factory = MagicMock(return_value=MagicMock())
 
-        agent, config, error = build_dynamic_agent(
+        result = build_dynamic_agent(
             ctx,
             name="test-agent",
             description="Test agent",
@@ -128,10 +127,8 @@ class TestBuildDynamicAgent:
             default_agent_factory=factory,
         )
 
-        assert agent is None
-        assert config is None
-        assert error is not None
-        assert "not supported" in error
+        assert isinstance(result, str)
+        assert "not supported" in result
         factory.assert_not_called()
 
     @pytest.mark.asyncio
@@ -139,7 +136,7 @@ class TestBuildDynamicAgent:
         ctx = MockRunContext(deps=MockDeps())
         with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.side_effect = ValueError("Invalid configuration")
-            agent, config, error = build_dynamic_agent(
+            result = build_dynamic_agent(
                 ctx,
                 name="test-agent",
                 description="Test agent",
@@ -147,17 +144,15 @@ class TestBuildDynamicAgent:
                 model="openai:gpt-4.1",
             )
 
-        assert agent is None
-        assert config is None
-        assert error is not None
-        assert "Invalid configuration" in error
+        assert isinstance(result, str)
+        assert "Invalid configuration" in result
 
     @pytest.mark.asyncio
     async def test_build_generic_exception(self):
         ctx = MockRunContext(deps=MockDeps())
         with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.side_effect = RuntimeError("Something went wrong")
-            agent, config, error = build_dynamic_agent(
+            result = build_dynamic_agent(
                 ctx,
                 name="test-agent",
                 description="Test agent",
@@ -165,7 +160,5 @@ class TestBuildDynamicAgent:
                 model="openai:gpt-4.1",
             )
 
-        assert agent is None
-        assert config is None
-        assert error is not None
-        assert "Error creating agent" in error
+        assert isinstance(result, str)
+        assert "Error creating agent" in result
