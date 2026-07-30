@@ -148,6 +148,19 @@ class TestSubAgentCapability:
         assert "delegate" in result
         assert "`task`" not in result
 
+    def test_oneshot_only_rejects_configured_subagents(self):
+        with pytest.raises(ValueError, match="cannot be combined with"):
+            _cap(
+                delegation_configuration="oneshot_only",
+                subagents=[
+                    SubAgentConfig(
+                        name="researcher",
+                        description="Researches topics",
+                        instructions="Research.",
+                    )
+                ],
+            )
+
     def test_max_result_chars_defaults_to_2000(self):
         """The result preview budget defaults to 2000 characters."""
         with patch("subagents_pydantic_ai.capability.create_subagent_toolset") as create_toolset:

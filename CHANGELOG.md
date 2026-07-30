@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `"persisted_and_oneshot"`: `create_agent` + `task` + `delegate`
   - `"oneshot_only"`: `delegate` only
   The ephemeral `delegate` path bypasses the registry, while `create_agent` stores reusable specialists for later `task` calls. Shared dynamic-agent validation and construction logic lives in `dynamic_agent.py`.
+- **`"oneshot_only"` rejects a non-empty `subagents` list at construction time.** Without `task` there is no way to reach a configured subagent, so combining the two would compile agents the model can never call. `create_subagent_toolset` (and `SubAgentCapability`) now raise `ValueError` instead of silently dropping the configuration.
 
 ### Fixed
 

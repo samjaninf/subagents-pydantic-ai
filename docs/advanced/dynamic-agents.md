@@ -322,6 +322,26 @@ create_subagent_toolset(
 
 After reaching the limit, creating new agents will fail until existing ones are removed.
 
+`create_subagent_toolset` exposes no `remove_agent` tool, so a parent using
+`"persisted"` or `"persisted_and_oneshot"` cannot free a slot on its own once
+`max_agents` is hit. Pair it with `create_agent_factory_toolset` over a shared
+registry when the parent should manage its own agents:
+
+```python
+registry = DynamicAgentRegistry(max_agents=3)
+
+agent = Agent(
+    "openai:gpt-4o",
+    toolsets=[
+        create_subagent_toolset(
+            registry=registry,
+            delegation_configuration="persisted",
+        ),
+        create_agent_factory_toolset(registry=registry),
+    ],
+)
+```
+
 ## Delegation Modes
 
 `delegation_configuration` controls the primary tools exposed to the parent:
