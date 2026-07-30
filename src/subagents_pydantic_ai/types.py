@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Literal
 
@@ -319,6 +320,11 @@ class TaskHandle:
         result: Task result (if completed)
         error: Error message (if failed)
         pending_question: Question waiting for answer (if any)
+        chat_trace_id: Chat trace ID for continuing this subagent conversation
+        run_id: Pydantic AI run ID for the subagent run
+        conversation_id: Pydantic AI conversation ID for the subagent run
+        traceparent: W3C traceparent for the subagent run span, if available
+        cost: Total subagent model cost calculated from genai-prices
     """
 
     task_id: str
@@ -332,8 +338,23 @@ class TaskHandle:
     result: str | None = None
     error: str | None = None
     pending_question: str | None = None
+    chat_trace_id: str | None = None
     usage: Any = None
-    """Token usage from the subagent run (`RunUsage` from pydantic-ai)."""
+    """Token usage from the subagent run (``RunUsage`` from pydantic-ai)."""
+    message_history: str | None = None
+    run_id: str | None = None
+    conversation_id: str | None = None
+    traceparent: str | None = None
+    trace_id: str | None = None
+    span_id: str | None = None
+    model_name: str | None = None
+    provider_name: str | None = None
+    provider_url: str | None = None
+    provider_response_id: str | None = None
+    provider_details: dict[str, Any] | None = None
+    finish_reason: Any = None
+    cost: Decimal | None = None
+    tool_call_counts: dict[str, int] = field(default_factory=dict)
     retry_count: int = 0
     """Number of transient-failure retries performed for this task."""
 

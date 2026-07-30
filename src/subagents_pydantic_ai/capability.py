@@ -85,6 +85,10 @@ class SubAgentCapability(AbstractCapability[Any]):
             Do not attach an `ask_parent` toolset in the factory; the toolset
             injects it at run time when needed.
         max_agents: Maximum number of persistent dynamic agents.
+        max_result_chars: Character budget for a completed task's result in the
+            `wait_tasks` listing. Truncated results carry an explicit marker
+            pointing at `check_task`, which always returns the full text. Pass
+            `None` to never truncate.
     """
 
     subagents: list[SubAgentConfig] | None = None
@@ -100,6 +104,7 @@ class SubAgentCapability(AbstractCapability[Any]):
     capabilities_map: dict[str, CapabilityFactory] | None = None
     default_agent_factory: Any | None = None
     max_agents: int = 10
+    max_result_chars: int | None = 2000
     _toolset: AbstractToolset[Any] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -119,6 +124,7 @@ class SubAgentCapability(AbstractCapability[Any]):
             capabilities_map=self.capabilities_map,
             default_agent_factory=self.default_agent_factory,
             max_agents=self.max_agents,
+            max_result_chars=self.max_result_chars,
         )
 
     @classmethod

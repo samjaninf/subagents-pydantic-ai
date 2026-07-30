@@ -34,6 +34,9 @@ toolset = create_subagent_toolset(subagents=subagents)
 | `capabilities_map` | `dict[str, Callable] \| None` | `None` | Capability factories for dynamic specialists |
 | `default_agent_factory` | `Callable \| None` | `None` | Custom agent factory for dynamic specialists |
 | `max_agents` | `int` | `10` | Maximum persistent agents in an internally created registry |
+| `max_chat_traces` | `int` | `100` | Max subagent conversations kept for `chat_trace_id` continuation (LRU-evicted) |
+| `max_task_handles` | `int` | `500` | Max finished task handles retained for status/observability (oldest evicted; usage totals preserved) |
+| `max_result_chars` | `int \| None` | `2000` | Character budget for a result shown by `wait_tasks`; longer results are cut with an explicit marker. `None` disables truncation |
 
 ## Adding to an Agent
 
@@ -131,6 +134,42 @@ task(
 | `description` | `str` | What the subagent should do |
 | `subagent_type` | `str` | Name of the subagent to use |
 | `mode` | `str` | `"sync"`, `"async"`, or `"auto"` |
+| `chat_trace_id` | `str \| None` | Continue a previous subagent conversation (see below) |
+
+#### Stateful conversations (`chat_trace_id`)
+
+Every successful task result ends with a `Chat Trace ID: <id>` line. Passing
+that ID back to `task()` resumes the same subagent conversation: the subagent
+sees the full message history of its previous run and continues from there.
+Omit `chat_trace_id` to start a fresh conversation.
+
+```python
+# First task — a new conversation is created automatically:
+task(description="Read the auth module and summarize it", subagent_type="researcher")
+# -> "...summary...\n\nChat Trace ID: 3f2a..."
+
+# Follow-up in the same conversation — the subagent remembers the module:
+task(
+    description="Now list the security issues you noticed",
+    subagent_type="researcher",
+    chat_trace_id="3f2a...",
+)
+```
+
+Rules and limits:
+
+- A trace belongs to one subagent: the history is stored per
+  `(subagent_name, chat_trace_id)`.
+- A trace can only be continued after its current task finishes. Continuing a
+  trace that still has a running task returns an error — wait via
+  `check_task`/`wait_tasks` first.
+- Passing an unknown `chat_trace_id` (typo, evicted trace, or a trace whose
+  first run failed) returns an error instead of silently starting over.
+- Only the `max_chat_traces` most recently used conversations are kept
+  (default 100, configurable on `create_subagent_toolset`); older ones are
+  evicted to bound memory in long-lived sessions.
+- History grows with every continuation — the full prior conversation is
+  replayed on each resumed run, so long traces cost more tokens per call.
 
 ### delegate
 
@@ -271,6 +310,25 @@ The output includes a header like
 `Task results (mode=any, 1/4 finished, 3 still running):` so the
 orchestrator can see which tasks are still in flight and decide whether
 to keep waiting or do other work first.
+
+#### Long results are truncated, and say so
+
+A fan-out of verbose subagents can flood the orchestrator's context, so
+`wait_tasks` shows at most `max_result_chars` (default 2000) of each result.
+A cut result always ends with an explicit marker:
+
+```text
+...the last of the 2000 shown characters
+
+[Result truncated for display: showing 2000 of 5231 characters. The subagent's
+answer is complete and stored in full. Call check_task('abc123') to read all of it.]
+```
+
+The marker matters as much as the limit. Without it an orchestrator reads a
+result that stops mid-sentence, concludes the subagent failed to finish, and
+delegates the same work again — a wasted round-trip caused entirely by the
+display limit. `check_task` always returns the untruncated result, and passing
+`max_result_chars=None` to `create_subagent_toolset` turns truncation off.
 
 ### soft_cancel_task
 

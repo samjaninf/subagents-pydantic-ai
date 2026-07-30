@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from agent_result_fakes import MockResult, MockResultWithMessages, MockUsage
 from pydantic import BaseModel
 from pydantic_ai import UsageLimits
 from pydantic_ai.models.test import TestModel
@@ -17,12 +20,13 @@ from pydantic_graph import End
 
 from subagents_pydantic_ai import DynamicAgentRegistry, SubAgentConfig, create_subagent_toolset
 from subagents_pydantic_ai.toolset import (
+    _capture_result_observability,
     _create_ask_parent_toolset,
     _create_general_purpose_config,
     _run_async,
     _run_sync,
 )
-from subagents_pydantic_ai.types import CompiledSubAgent, TaskPriority, TaskStatus
+from subagents_pydantic_ai.types import CompiledSubAgent, TaskHandle, TaskPriority, TaskStatus
 
 
 @dataclass
@@ -43,26 +47,33 @@ class MockRunContext:
     _subagent_state: dict[str, Any] | None = None
 
 
-class MockUsage:
-    """Mock RunUsage."""
+class MockModelResponse:
+    """Minimal pydantic-ai ModelResponse stand-in for observability tests."""
 
-    def __init__(self, input_tokens: int = 100, output_tokens: int = 50, requests: int = 1):
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-        self.requests = requests
+    kind = "response"
+    cost_called = False
 
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        provider_name: str,
+        total_price: Decimal,
+        tool_names: list[str] | None = None,
+    ):
+        self.model_name = model_name
+        self.provider_name = provider_name
+        self.provider_url = "https://example.test/v1"
+        self.provider_response_id = "provider-response-123"
+        self.provider_details = {"region": "test"}
+        self.finish_reason = "stop"
+        self.tool_calls = [SimpleNamespace(tool_name=name) for name in tool_names or []]
+        self._total_price = total_price
+        self.cost_called = False
 
-class MockResult:
-    """Mock agent result."""
-
-    def __init__(self, output: Any = "mock result"):
-        self.output = output
-        self._usage = MockUsage()
-
-    @property
-    def usage(self) -> MockUsage:
-        # pydantic-ai 2.0: `AgentRunResult.usage` is a property, not a method.
-        return self._usage
+    def cost(self) -> Any:
+        self.cost_called = True
+        return SimpleNamespace(total_price=self._total_price)
 
 
 class _FakeRun:
@@ -796,6 +807,73 @@ class TestRunSync:
         assert mock_agent.iter_calls[0]["usage_limits"] is usage_limits
 
     @pytest.mark.asyncio
+    async def test_run_sync_stores_usage_details_and_message_history_on_handle(self):
+        """Sync execution stores observability data on the supplied handle."""
+        mock_agent = FakeAgent(
+            result=MockResult(
+                "task completed",
+                usage=MockUsage(details={"reasoning_tokens": 42}),
+                messages=[{"role": "user", "content": "work"}],
+            )
+        )
+        handle = TaskHandle(
+            task_id="task-123",
+            subagent_name="test",
+            description="do the thing",
+        )
+
+        config = SubAgentConfig(
+            name="test",
+            description="Test agent",
+            instructions="Do test",
+        )
+
+        result = await _run_sync(
+            agent=mock_agent,
+            config=config,
+            description="do the thing",
+            deps=MockDeps(),
+            task_id="task-123",
+            handle=handle,
+        )
+
+        assert result == "task completed"
+        assert handle.status == TaskStatus.COMPLETED
+        assert handle.usage.details["reasoning_tokens"] == 42
+        assert handle.message_history is not None
+        assert '"content": "work"' in handle.message_history
+
+    @pytest.mark.asyncio
+    async def test_run_sync_resumes_and_captures_message_history(self):
+        """Sessions can seed and update sync subagent history."""
+        seed_history = [{"role": "assistant", "content": "previous"}]
+        new_history = [{"role": "assistant", "content": "updated"}]
+        captured: list[list[Any]] = []
+        mock_agent = FakeAgent(
+            result=MockResultWithMessages("task completed", messages=new_history)
+        )
+
+        config = SubAgentConfig(
+            name="test",
+            description="Test agent",
+            instructions="Do test",
+        )
+
+        result = await _run_sync(
+            agent=mock_agent,
+            config=config,
+            description="do the next thing",
+            deps=MockDeps(),
+            task_id="task-123",
+            message_history=seed_history,
+            on_message_history=captured.append,
+        )
+
+        assert result == "task completed"
+        assert mock_agent.iter_calls[0]["message_history"] is seed_history
+        assert captured == [new_history]
+
+    @pytest.mark.asyncio
     async def test_run_sync_error(self):
         """Test sync execution with error."""
         mock_agent = FakeAgent(error=Exception("Something went wrong"))
@@ -867,6 +945,83 @@ class TestRunSync:
         assert not hasattr(deps, "_subagent_state")
 
 
+class TestResultObservability:
+    """Tests for copying AgentRunResult observability onto task handles."""
+
+    def test_capture_result_observability(self):
+        first_response = MockModelResponse(
+            model_name="gpt-first",
+            provider_name="openai",
+            total_price=Decimal("0.01"),
+            tool_names=["search", "task"],
+        )
+        second_response = MockModelResponse(
+            model_name="gpt-second",
+            provider_name="openai",
+            total_price=Decimal("0.02"),
+            tool_names=["search"],
+        )
+        result = MockResult(
+            "done",
+            messages=[first_response, second_response],
+            run_id="run-abc",
+            conversation_id="conversation-abc",
+            traceparent="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
+        handle = TaskHandle(
+            task_id="task-123",
+            subagent_name="test",
+            description="do the thing",
+        )
+
+        _capture_result_observability(handle, result)
+
+        assert handle.usage is result.usage
+        assert handle.message_history is not None
+        assert handle.run_id == "run-abc"
+        assert handle.conversation_id == "conversation-abc"
+        assert handle.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736"
+        assert handle.span_id == "00f067aa0ba902b7"
+        assert handle.model_name == "gpt-second"
+        assert handle.provider_name == "openai"
+        assert handle.provider_url == "https://example.test/v1"
+        assert handle.provider_response_id == "provider-response-123"
+        assert handle.provider_details == {"region": "test"}
+        assert handle.finish_reason == "stop"
+        assert handle.cost == Decimal("0.03")
+        assert handle.tool_call_counts == {"search": 2, "task": 1}
+
+    def test_capture_result_observability_skips_cost_without_model_name(self):
+        response_without_model_name = MockModelResponse(
+            model_name="",
+            provider_name="openai",
+            total_price=Decimal("0.01"),
+            tool_names=["search"],
+        )
+        priced_response = MockModelResponse(
+            model_name="gpt-priced",
+            provider_name="openai",
+            total_price=Decimal("0.02"),
+            tool_names=["task"],
+        )
+        result = MockResult(
+            "done",
+            messages=[response_without_model_name, priced_response],
+        )
+        handle = TaskHandle(
+            task_id="task-123",
+            subagent_name="test",
+            description="do the thing",
+        )
+
+        _capture_result_observability(handle, result)
+
+        assert not response_without_model_name.cost_called
+        assert priced_response.cost_called
+        assert handle.cost == Decimal("0.02")
+        assert handle.tool_call_counts == {"search": 1, "task": 1}
+
+
 class TestRunAsync:
     """Tests for _run_async function."""
 
@@ -899,6 +1054,43 @@ class TestRunAsync:
         assert "Task started in background" in result
         assert "task-123" in result
         assert "check_task" in result
+
+    @pytest.mark.asyncio
+    async def test_run_async_resumes_and_captures_message_history(self):
+        """Explicit chat traces can seed and update async subagent history."""
+        from subagents_pydantic_ai import InMemoryMessageBus, TaskManager
+
+        seed_history = [{"role": "assistant", "content": "previous"}]
+        new_history = [{"role": "assistant", "content": "updated"}]
+        captured: list[list[Any]] = []
+        mock_agent = FakeAgent(
+            result=MockResultWithMessages("task completed", messages=new_history)
+        )
+
+        config = SubAgentConfig(
+            name="test",
+            description="Test agent",
+            instructions="Do test",
+        )
+
+        message_bus = InMemoryMessageBus()
+        task_manager = TaskManager(message_bus=message_bus)
+
+        await _run_async(
+            agent=mock_agent,
+            config=config,
+            description="do the thing",
+            deps=MockDeps(),
+            task_id="task-123",
+            task_manager=task_manager,
+            message_bus=message_bus,
+            message_history=seed_history,
+            on_message_history=captured.append,
+        )
+        await asyncio.sleep(0.1)
+
+        assert mock_agent.iter_calls[0]["message_history"] is seed_history
+        assert captured == [new_history]
 
     @pytest.mark.asyncio
     async def test_run_async_task_completes(self):
@@ -936,6 +1128,47 @@ class TestRunAsync:
         assert handle.result == "task completed"
         assert handle.usage is not None
         assert handle.usage.input_tokens == 100
+
+    @pytest.mark.asyncio
+    async def test_run_async_stores_usage_details_and_message_history(self):
+        """Async execution stores full usage details and subagent messages."""
+        import asyncio
+
+        from subagents_pydantic_ai import InMemoryMessageBus, TaskManager
+
+        mock_agent = FakeAgent(
+            result=MockResult(
+                "task completed",
+                usage=MockUsage(details={"reasoning_tokens": 17}),
+                messages=[{"role": "assistant", "content": "done"}],
+            )
+        )
+
+        config = SubAgentConfig(
+            name="test",
+            description="Test agent",
+            instructions="Do test",
+        )
+
+        message_bus = InMemoryMessageBus()
+        task_manager = TaskManager(message_bus=message_bus)
+
+        await _run_async(
+            agent=mock_agent,
+            config=config,
+            description="do the thing",
+            deps=MockDeps(),
+            task_id="task-observe",
+            task_manager=task_manager,
+            message_bus=message_bus,
+        )
+        await asyncio.sleep(0.1)
+
+        handle = task_manager.get_handle("task-observe")
+        assert handle is not None
+        assert handle.usage.details["reasoning_tokens"] == 17
+        assert handle.message_history is not None
+        assert '"content": "done"' in handle.message_history
 
     @pytest.mark.asyncio
     async def test_run_async_forwards_usage_limits(self):
@@ -1028,7 +1261,7 @@ class TestToolsetIntegration:
                 "subagents_pydantic_ai.toolset._run_sync",
                 new_callable=AsyncMock,
                 return_value="Sync result",
-            ),
+            ) as mock_run_sync,
         ):
             toolset = create_subagent_toolset(
                 subagents=[config],
@@ -1040,7 +1273,13 @@ class TestToolsetIntegration:
             ctx = MockRunContext(deps=MockDeps())
             result = await task_tool.function(ctx, "do something", "helper", "sync")
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
+            handle = mock_run_sync.call_args.kwargs["handle"]
+            assert handle.task_id in toolset.task_manager.handles  # type: ignore[attr-defined]
+            assert handle.chat_trace_id in result
+            assert len(handle.chat_trace_id) == 32
+            int(handle.chat_trace_id, 16)
+            assert "pass this chat_trace_id to task()" not in result
 
     @pytest.mark.asyncio
     async def test_task_sync_forwards_ask_user(self):
@@ -1109,6 +1348,327 @@ class TestToolsetIntegration:
 
             assert "Task started" in result
 
+    @pytest.mark.asyncio
+    async def test_task_chat_trace_reuses_message_history(self):
+        """task(chat_trace_id=...) stores and reuses history for that subagent."""
+        config = SubAgentConfig(
+            name="worker",
+            description="Does work",
+            instructions="Work on things",
+        )
+        saved_history = [{"role": "assistant", "content": "remembered"}]
+        mock_agent = FakeAgent(result=MockResultWithMessages("done", messages=saved_history))
+        mock_compiled = CompiledSubAgent(
+            name=config["name"],
+            description=config["description"],
+            config=config,
+            agent=mock_agent,
+        )
+
+        with patch(
+            "subagents_pydantic_ai.toolset._compile_subagent",
+            return_value=mock_compiled,
+        ):
+            toolset = create_subagent_toolset(
+                subagents=[config],
+                include_general_purpose=False,
+            )
+
+            task_tool = toolset.tools["task"]
+            ctx = MockRunContext(deps=MockDeps())
+
+            first = await task_tool.function(ctx, "remember this", "worker", "sync")
+            trace_id = first.split("Chat Trace ID: ")[1].split("\n")[0]
+            second = await task_tool.function(
+                ctx,
+                "continue",
+                "worker",
+                "sync",
+                chat_trace_id=trace_id,
+            )
+
+            assert first.startswith("done\n\nChat Trace ID: ")
+            assert second.startswith(f"done\n\nChat Trace ID: {trace_id}")
+            assert mock_agent.iter_calls[0]["message_history"] is None
+            assert mock_agent.iter_calls[1]["message_history"] == saved_history
+            assert toolset.message_history_store[("worker", trace_id)] == saved_history
+
+    @pytest.mark.asyncio
+    async def test_task_without_chat_trace_id_creates_saved_trace(self):
+        """Omitting chat_trace_id starts a new saved subagent conversation."""
+        config = SubAgentConfig(
+            name="worker",
+            description="Does work",
+            instructions="Work on things",
+        )
+        saved_history = [{"role": "assistant", "content": "remembered"}]
+        mock_agent = FakeAgent(result=MockResultWithMessages("done", messages=saved_history))
+        mock_compiled = CompiledSubAgent(
+            name=config["name"],
+            description=config["description"],
+            config=config,
+            agent=mock_agent,
+        )
+
+        with patch(
+            "subagents_pydantic_ai.toolset._compile_subagent",
+            return_value=mock_compiled,
+        ):
+            toolset = create_subagent_toolset(
+                subagents=[config],
+                include_general_purpose=False,
+            )
+
+            task_tool = toolset.tools["task"]
+            ctx = MockRunContext(deps=MockDeps())
+
+            first = await task_tool.function(ctx, "remember this", "worker", "sync")
+            first_chat_trace_id = first.split("Chat Trace ID: ")[1].split("\n")[0]
+            second = await task_tool.function(ctx, "fresh task", "worker", "sync")
+            second_chat_trace_id = second.split("Chat Trace ID: ")[1].split("\n")[0]
+            continued = await task_tool.function(
+                ctx,
+                "continue first",
+                "worker",
+                "sync",
+                chat_trace_id=first_chat_trace_id,
+            )
+
+            assert first_chat_trace_id
+            assert second_chat_trace_id
+            assert len(first_chat_trace_id) == 32
+            assert len(second_chat_trace_id) == 32
+            int(first_chat_trace_id, 16)
+            int(second_chat_trace_id, 16)
+            assert second_chat_trace_id != first_chat_trace_id
+            assert continued.startswith(f"done\n\nChat Trace ID: {first_chat_trace_id}")
+            assert mock_agent.iter_calls[0]["message_history"] is None
+            assert mock_agent.iter_calls[1]["message_history"] is None
+            assert mock_agent.iter_calls[2]["message_history"] == saved_history
+            assert toolset.message_history_store[("worker", first_chat_trace_id)] == saved_history
+            assert toolset.message_history_store[("worker", second_chat_trace_id)] == saved_history
+
+
+class TestChatTraceLifecycle:
+    """Tests for chat trace guards, LRU eviction, and handle retention."""
+
+    @staticmethod
+    def _make_toolset(mock_agent: FakeAgent, **kwargs: Any) -> Any:
+        config = SubAgentConfig(
+            name="worker",
+            description="Does work",
+            instructions="Work on things",
+        )
+        mock_compiled = CompiledSubAgent(
+            name=config["name"],
+            description=config["description"],
+            config=config,
+            agent=mock_agent,
+        )
+        with patch(
+            "subagents_pydantic_ai.toolset._compile_subagent",
+            return_value=mock_compiled,
+        ):
+            return create_subagent_toolset(
+                subagents=[config],
+                include_general_purpose=False,
+                **kwargs,
+            )
+
+    @staticmethod
+    def _trace_id(result: str) -> str:
+        return result.split("Chat Trace ID: ")[1].split("\n")[0]
+
+    @pytest.mark.asyncio
+    async def test_task_unknown_chat_trace_id_errors(self):
+        """An explicit chat_trace_id with no saved history fails loudly."""
+        mock_agent = FakeAgent(result=MockResultWithMessages("done", messages=[{"m": 1}]))
+        toolset = self._make_toolset(mock_agent)
+        task_tool = toolset.tools["task"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        result = await task_tool.function(
+            ctx, "continue", "worker", "sync", chat_trace_id="no-such-trace"
+        )
+
+        assert result.startswith("Error: no saved conversation for chat_trace_id 'no-such-trace'")
+        # The subagent was never run and nothing was saved under the bogus key.
+        assert mock_agent.iter_calls == []
+        assert ("worker", "no-such-trace") not in toolset.message_history_store
+
+    @pytest.mark.asyncio
+    async def test_task_busy_chat_trace_errors_until_finished(self):
+        """A trace with a running task refuses continuation, then allows it."""
+        saved_history = [{"role": "assistant", "content": "remembered"}]
+        mock_agent = FakeAgent(
+            result=MockResultWithMessages("done", messages=saved_history), delay=0.2
+        )
+        toolset = self._make_toolset(mock_agent)
+        task_tool = toolset.tools["task"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        started = await task_tool.function(ctx, "long job", "worker", "async")
+        trace_id = self._trace_id(started)
+
+        busy = await task_tool.function(
+            ctx, "continue too early", "worker", "sync", chat_trace_id=trace_id
+        )
+        assert busy.startswith(f"Error: chat trace '{trace_id}' already has a running task")
+
+        await asyncio.sleep(0.35)
+
+        continued = await task_tool.function(
+            ctx, "continue", "worker", "sync", chat_trace_id=trace_id
+        )
+        assert continued.startswith(f"done\n\nChat Trace ID: {trace_id}")
+        assert mock_agent.iter_calls[-1]["message_history"] == saved_history
+
+    @pytest.mark.asyncio
+    async def test_message_history_store_evicts_least_recently_used(self):
+        """The store is bounded and continuing a trace refreshes its recency."""
+        saved_history = [{"role": "assistant", "content": "remembered"}]
+        mock_agent = FakeAgent(result=MockResultWithMessages("done", messages=saved_history))
+        toolset = self._make_toolset(mock_agent, max_chat_traces=2)
+        task_tool = toolset.tools["task"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        first_id = self._trace_id(await task_tool.function(ctx, "one", "worker", "sync"))
+        second_id = self._trace_id(await task_tool.function(ctx, "two", "worker", "sync"))
+        # Continue the first trace so it becomes most recently used.
+        await task_tool.function(ctx, "one again", "worker", "sync", chat_trace_id=first_id)
+        third_id = self._trace_id(await task_tool.function(ctx, "three", "worker", "sync"))
+
+        store = toolset.message_history_store
+        assert len(store) == 2
+        assert ("worker", first_id) in store
+        assert ("worker", third_id) in store
+        assert ("worker", second_id) not in store
+
+        evicted = await task_tool.function(
+            ctx, "continue evicted", "worker", "sync", chat_trace_id=second_id
+        )
+        assert evicted.startswith("Error: no saved conversation")
+
+    @pytest.mark.asyncio
+    async def test_finished_handles_evicted_and_usage_preserved(self):
+        """Old finished handles are evicted but get_total_usage stays correct."""
+        mock_agent = FakeAgent(
+            result=MockResult("done", messages=[{"role": "assistant", "content": "x"}])
+        )
+        toolset = self._make_toolset(mock_agent, max_task_handles=2)
+        task_tool = toolset.tools["task"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        # A stale finished handle without usage (e.g. a cancelled task) is
+        # evicted first and must not contribute to the totals.
+        stale = TaskHandle(
+            task_id="stale-no-usage",
+            subagent_name="worker",
+            description="old cancelled task",
+            status=TaskStatus.CANCELLED,
+            completed_at=datetime(2020, 1, 1),
+        )
+        toolset.task_manager.handles["stale-no-usage"] = stale
+
+        for i in range(4):
+            await task_tool.function(ctx, f"job {i}", "worker", "sync")
+
+        # Eviction runs before each new task registers its handle: before the
+        # 4th task there were 3 finished handles, so the oldest was dropped.
+        assert len(toolset.task_manager.handles) == 3
+        assert "stale-no-usage" not in toolset.task_manager.handles
+        # All 4 runs still counted (MockUsage: 100 in / 50 out / 1 request).
+        totals = toolset.get_total_usage()
+        assert totals == {
+            "input_tokens": 400,
+            "output_tokens": 200,
+            "total_tokens": 600,
+            "requests": 4,
+        }
+
+    @pytest.mark.asyncio
+    async def test_async_dispatch_failure_releases_chat_trace(self):
+        """If _run_async raises before the background task takes ownership,
+        the trace guard is released so the conversation stays continuable."""
+        saved_history = [{"role": "assistant", "content": "remembered"}]
+        mock_agent = FakeAgent(result=MockResultWithMessages("done", messages=saved_history))
+        toolset = self._make_toolset(mock_agent)
+        task_tool = toolset.tools["task"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        trace_id = self._trace_id(await task_tool.function(ctx, "seed", "worker", "sync"))
+
+        with (
+            patch(
+                "subagents_pydantic_ai.toolset._run_async",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("dispatch failed"),
+            ),
+            pytest.raises(RuntimeError, match="dispatch failed"),
+        ):
+            await task_tool.function(ctx, "continue", "worker", "async", chat_trace_id=trace_id)
+
+        # The guard was released, so continuing the trace works instead of
+        # returning a "already has a running task" error.
+        continued = await task_tool.function(
+            ctx, "continue", "worker", "sync", chat_trace_id=trace_id
+        )
+        assert continued.startswith(f"done\n\nChat Trace ID: {trace_id}")
+
+    @pytest.mark.asyncio
+    async def test_run_sync_completes_when_history_capture_raises(self):
+        """A raising all_messages() must not flip a successful run to FAILED."""
+
+        class RaisingHistoryResult(MockResult):
+            def all_messages(self) -> list[Any]:
+                raise RuntimeError("history exploded")
+
+        captured: list[list[Any]] = []
+        mock_agent = FakeAgent(result=RaisingHistoryResult("ok"))
+        config = SubAgentConfig(name="worker", description="d", instructions="i")
+        handle = TaskHandle(task_id="t-raise", subagent_name="worker", description="d")
+
+        result = await _run_sync(
+            agent=mock_agent,
+            config=config,
+            description="do it",
+            deps=MockDeps(),
+            task_id="t-raise",
+            handle=handle,
+            on_message_history=captured.append,
+        )
+
+        assert result == "ok"
+        assert handle.status == TaskStatus.COMPLETED
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_check_task_shows_chat_trace_id_only_when_completed(self):
+        """check_task must not advertise continuation for unfinished/failed tasks."""
+        toolset = create_subagent_toolset(default_model="test")
+        tm = toolset.task_manager  # type: ignore[attr-defined]
+        handle = TaskHandle(
+            task_id="trace-vis",
+            subagent_name="worker",
+            description="test task",
+            status=TaskStatus.FAILED,
+            error="boom",
+            chat_trace_id="abc123",
+        )
+        tm.handles["trace-vis"] = handle
+
+        check_tool = toolset.tools["check_task"]
+        ctx = MockRunContext(deps=MockDeps())
+
+        failed = await check_tool.function(ctx, "trace-vis")
+        assert "Chat Trace ID" not in failed
+        assert "Error: boom" in failed
+
+        handle.status = TaskStatus.COMPLETED
+        handle.result = "done"
+        completed = await check_tool.function(ctx, "trace-vis")
+        assert "Chat Trace ID: abc123" in completed
+
 
 class TestAutoModeSelection:
     """Tests for auto-mode selection in task tool."""
@@ -1152,8 +1712,52 @@ class TestAutoModeSelection:
                 False,  # may_need_clarification
             )
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             mock_sync.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_task_sync_failure_omits_chat_trace_hint(self):
+        """A failed sync run must not advertise continuation (no history saved)."""
+        config = SubAgentConfig(
+            name="helper",
+            description="Helps with tasks",
+            instructions="Help with things",
+        )
+
+        def _fail_sync(**kwargs):
+            kwargs["handle"].status = TaskStatus.FAILED
+            return "Error executing task: boom"
+
+        with (
+            patch(
+                "subagents_pydantic_ai.toolset._compile_subagent",
+                return_value=_make_mock_compiled_subagent(config),
+            ),
+            patch(
+                "subagents_pydantic_ai.toolset._run_sync",
+                new_callable=AsyncMock,
+                side_effect=_fail_sync,
+            ),
+        ):
+            toolset = create_subagent_toolset(
+                subagents=[config],
+                include_general_purpose=False,
+            )
+            task_tool = toolset.tools["task"]
+            ctx = MockRunContext(deps=MockDeps())
+            result = await task_tool.function(
+                ctx,
+                "do something",
+                "helper",
+                "sync",
+                TaskPriority.NORMAL,
+                "simple",
+                False,
+                False,
+            )
+
+            assert result == "Error executing task: boom"
+            assert "Chat Trace ID" not in result
 
     @pytest.mark.asyncio
     async def test_task_auto_mode_complex_uses_async(self):
@@ -1236,7 +1840,7 @@ class TestAutoModeSelection:
                 False,  # may_need_clarification
             )
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1315,7 +1919,7 @@ class TestAutoModeSelection:
                 "auto",  # auto mode - uses config's typical_complexity
             )
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1356,7 +1960,7 @@ class TestAutoModeSelection:
                 "auto",
             )
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             mock_sync.assert_called_once()
 
     @pytest.mark.asyncio
@@ -1398,7 +2002,7 @@ class TestAutoModeSelection:
                 "complex",  # Would normally be async
             )
 
-            assert result == "Sync result"
+            assert result.startswith("Sync result\n\nChat Trace ID: ")
             mock_sync.assert_called_once()
 
 
@@ -2921,8 +3525,8 @@ class TestUsageTracking:
     """Tests for subagent token usage tracking."""
 
     @pytest.mark.anyio
-    async def test_check_task_shows_usage(self):
-        """check_task displays usage info for completed tasks."""
+    async def test_check_task_does_not_show_usage(self):
+        """check_task keeps observability data out of tool-return text."""
         from subagents_pydantic_ai.types import TaskHandle, TaskStatus
 
         toolset = create_subagent_toolset(default_model="test")
@@ -2940,9 +3544,84 @@ class TestUsageTracking:
         check_tool = toolset.tools["check_task"]
         ctx = MockRunContext(deps=MockDeps())
         result = await check_tool.function(ctx, "test-usage")
-        assert "500" in result
-        assert "200" in result
-        assert "Usage:" in result
+        assert "Result: done" in result
+        assert "Usage:" not in result
+        assert handle.usage.input_tokens == 500
+
+    @pytest.mark.anyio
+    async def test_check_task_does_not_show_usage_details(self):
+        """Usage details stay available on the handle only."""
+        from subagents_pydantic_ai.types import TaskHandle, TaskStatus
+
+        toolset = create_subagent_toolset(default_model="test")
+        tm = toolset.task_manager  # type: ignore[attr-defined]
+        handle = TaskHandle(
+            task_id="test-details",
+            subagent_name="worker",
+            description="test task",
+            status=TaskStatus.COMPLETED,
+            result="done",
+            usage=MockUsage(input_tokens=500, output_tokens=200, details={"reasoning_tokens": 31}),
+        )
+        tm.handles["test-details"] = handle
+
+        check_tool = toolset.tools["check_task"]
+        ctx = MockRunContext(deps=MockDeps())
+        result = await check_tool.function(ctx, "test-details")
+        assert "Usage attributes:" not in result
+        assert "gen_ai.usage.details.reasoning_tokens" not in result
+        assert handle.usage.details["reasoning_tokens"] == 31
+
+    @pytest.mark.anyio
+    async def test_check_task_does_not_show_message_history(self):
+        """Message history stays available on the handle only."""
+        from subagents_pydantic_ai.types import TaskHandle, TaskStatus
+
+        toolset = create_subagent_toolset(default_model="test")
+        tm = toolset.task_manager  # type: ignore[attr-defined]
+        handle = TaskHandle(
+            task_id="test-history",
+            subagent_name="worker",
+            description="test task",
+            status=TaskStatus.COMPLETED,
+            result="done",
+            usage=MockUsage(),
+            message_history='[{"role": "assistant", "content": "history"}]',
+        )
+        tm.handles["test-history"] = handle
+
+        check_tool = toolset.tools["check_task"]
+        ctx = MockRunContext(deps=MockDeps())
+        result = await check_tool.function(ctx, "test-history")
+        assert "Message history:" not in result
+        assert '"content": "history"' not in result
+        assert handle.message_history == '[{"role": "assistant", "content": "history"}]'
+
+    @pytest.mark.anyio
+    async def test_wait_tasks_does_not_show_observability(self):
+        """wait_tasks keeps observability data out of tool-return text."""
+        from subagents_pydantic_ai.types import TaskHandle, TaskStatus
+
+        toolset = create_subagent_toolset(default_model="test")
+        tm = toolset.task_manager  # type: ignore[attr-defined]
+        handle = TaskHandle(
+            task_id="wait-observe",
+            subagent_name="worker",
+            description="test task",
+            status=TaskStatus.COMPLETED,
+            result="done",
+            usage=MockUsage(details={"reasoning_tokens": 23}),
+            message_history='[{"role": "assistant", "content": "wait history"}]',
+        )
+        tm.handles["wait-observe"] = handle
+
+        wait_tool = toolset.tools["wait_tasks"]
+        ctx = MockRunContext(deps=MockDeps())
+        result = await wait_tool.function(ctx, ["wait-observe"])
+        assert "gen_ai.usage.details.reasoning_tokens" not in result
+        assert '"content": "wait history"' not in result
+        assert handle.usage.details["reasoning_tokens"] == 23
+        assert handle.message_history == '[{"role": "assistant", "content": "wait history"}]'
 
     @pytest.mark.anyio
     async def test_list_handles(self):
@@ -3023,43 +3702,6 @@ class TestUsageTracking:
         result = await check_tool.function(ctx, "no-usage")
         assert "Result: done" in result
         assert "Usage:" not in result
-
-    @pytest.mark.anyio
-    async def test_run_async_no_usage_attr(self):
-        """Async run handles results without usage() method."""
-
-        from subagents_pydantic_ai import InMemoryMessageBus, TaskManager
-
-        class BareResult:
-            def __init__(self, output: str):
-                self.output = output
-
-        mock_agent = FakeAgent(result=BareResult("bare output"))
-
-        config = SubAgentConfig(
-            name="test",
-            description="Test",
-            instructions="Do test",
-        )
-        message_bus = InMemoryMessageBus()
-        task_manager = TaskManager(message_bus=message_bus)
-
-        await _run_async(
-            agent=mock_agent,
-            config=config,
-            description="test",
-            deps=MockDeps(),
-            task_id="bare-1",
-            task_manager=task_manager,
-            message_bus=message_bus,
-        )
-        await asyncio.sleep(0.1)
-
-        handle = task_manager.get_handle("bare-1")
-        assert handle is not None
-        assert handle.status == TaskStatus.COMPLETED
-        assert handle.result == "bare output"
-        assert handle.usage is None
 
 
 class TestDrainSteeringMessages:
@@ -3291,7 +3933,7 @@ class TestDelegationConfiguration:
             description="Analyze the data",
             subagent_type="analyst",
         )
-        assert task_result == "persisted result"
+        assert task_result.startswith("persisted result\n\nChat Trace ID: ")
 
     @pytest.mark.asyncio
     async def test_create_agent_duplicate_name(self, registry):
@@ -3386,7 +4028,7 @@ class TestDelegationConfiguration:
                 instructions="You are a data analyst.",
             )
 
-        assert result == "oneshot result"
+        assert result.startswith("oneshot result\n\nChat Trace ID: ")
 
     @pytest.mark.asyncio
     async def test_delegate_does_not_register_agent(self, registry):
@@ -3407,7 +4049,7 @@ class TestDelegationConfiguration:
                 instructions="You are a worker.",
             )
 
-        assert result == "oneshot result"
+        assert result.startswith("oneshot result\n\nChat Trace ID: ")
         assert registry.count() == 0
 
     @pytest.mark.asyncio
@@ -3437,7 +4079,7 @@ class TestDelegationConfiguration:
                 instructions="You are a worker.",
             )
 
-        assert result == "still works"
+        assert result.startswith("still works\n\nChat Trace ID: ")
         assert registry.count() == 1
 
     @pytest.mark.asyncio
@@ -3528,3 +4170,214 @@ class TestDelegationConfiguration:
 
         assert "Error executing task" in result
         assert "delegate failed" in result
+
+
+class TestObservabilityHelpers:
+    """Direct unit tests for the observability helper branches."""
+
+    def test_capture_message_history_skips_result_without_all_messages(self):
+        from subagents_pydantic_ai.toolset import _capture_message_history
+
+        captured: list[Any] = []
+        _capture_message_history(object(), captured.append)
+        assert captured == []
+
+    def test_get_result_traceparent_none_when_absent(self):
+        from subagents_pydantic_ai.toolset import _get_result_traceparent
+
+        assert _get_result_traceparent(object()) is None
+
+    def test_iter_model_responses_includes_result_response(self):
+        from subagents_pydantic_ai.toolset import _iter_model_responses
+
+        sentinel = object()
+
+        class _Result:
+            def all_messages(self) -> list[Any]:
+                return []
+
+            @property
+            def response(self) -> Any:
+                return sentinel
+
+        assert _iter_model_responses(_Result()) == [sentinel]
+
+    def test_capture_observability_sets_trace_and_span_from_traceparent(self):
+        from subagents_pydantic_ai.toolset import _capture_result_observability
+
+        class _Result:
+            usage = None
+            run_id = "r"
+            conversation_id = "c"
+
+            def all_messages_json(self) -> bytes:
+                return b"[]"
+
+            def all_messages(self) -> list[Any]:
+                return []
+
+            def _traceparent(self, required: bool = False) -> str:
+                return "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+        handle = TaskHandle(task_id="t", subagent_name="s", description="d")
+        _capture_result_observability(handle, _Result())
+        assert handle.trace_id == "0af7651916cd43dd8448eb211c80319c"
+        assert handle.span_id == "b7ad6b7169203331"
+
+    def test_capture_observability_ignores_malformed_traceparent(self):
+        from subagents_pydantic_ai.toolset import _capture_result_observability
+
+        class _Result:
+            usage = None
+            run_id = "r"
+            conversation_id = "c"
+
+            def all_messages_json(self) -> bytes:
+                return b"[]"
+
+            def all_messages(self) -> list[Any]:
+                return []
+
+            def _traceparent(self, required: bool = False) -> str:
+                return "00-abc"
+
+        handle = TaskHandle(task_id="t", subagent_name="s", description="d")
+        _capture_result_observability(handle, _Result())
+        assert handle.traceparent == "00-abc"
+        assert handle.trace_id is None
+        assert handle.span_id is None
+
+
+class TestPreviewResult:
+    """Tests for the _preview_result helper backing wait_tasks previews."""
+
+    def test_short_result_is_unchanged(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        assert _preview_result("short answer", "abc123", 2000) == "short answer"
+
+    def test_result_at_budget_is_not_truncated(self):
+        """A result exactly at the budget is complete, so it gets no marker."""
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        result = "x" * 100
+        assert _preview_result(result, "abc123", 100) == result
+
+    def test_result_one_char_over_budget_is_truncated(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        preview = _preview_result("x" * 101, "abc123", 100)
+        assert preview.startswith("x" * 100)
+        assert "x" * 101 not in preview
+        assert "showing 100 of 101 characters" in preview
+
+    def test_marker_points_at_check_task_with_the_task_id(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        preview = _preview_result("y" * 50, "task-42", 10)
+        assert "Result truncated for display" in preview
+        assert "check_task('task-42')" in preview
+        assert "The subagent's answer is complete" in preview
+
+    def test_none_budget_never_truncates(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        result = "z" * 10_000
+        assert _preview_result(result, "abc123", None) == result
+
+    def test_zero_budget_yields_marker_only(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        preview = _preview_result("hidden", "abc123", 0)
+        assert preview.startswith("\n\n[Result truncated for display")
+        assert "hidden" not in preview
+
+    def test_empty_result_is_unchanged(self):
+        from subagents_pydantic_ai.toolset import _preview_result
+
+        assert _preview_result("", "abc123", 2000) == ""
+
+
+class TestWaitTasksResultTruncation:
+    """wait_tasks must never hand the orchestrator a silently cut result."""
+
+    @staticmethod
+    def _toolset_with_result(result: str, /, **kwargs: Any) -> tuple[Any, Any]:
+        toolset = create_subagent_toolset(default_model="test", **kwargs)
+        tm = toolset.task_manager  # type: ignore[attr-defined]
+        tm.handles["long-task"] = TaskHandle(
+            task_id="long-task",
+            subagent_name="worker",
+            description="verbose task",
+            status=TaskStatus.COMPLETED,
+            result=result,
+        )
+        return toolset, tm
+
+    @pytest.mark.anyio
+    async def test_truncated_result_carries_a_marker(self):
+        toolset, _ = self._toolset_with_result("a" * 2500)
+
+        wait_tool = toolset.tools["wait_tasks"]
+        output = await wait_tool.function(MockRunContext(deps=MockDeps()), ["long-task"])
+
+        assert "COMPLETED" in output
+        assert "showing 2000 of 2500 characters" in output
+        assert "check_task('long-task')" in output
+
+    @pytest.mark.anyio
+    async def test_result_within_budget_has_no_marker(self):
+        toolset, _ = self._toolset_with_result("complete answer")
+
+        wait_tool = toolset.tools["wait_tasks"]
+        output = await wait_tool.function(MockRunContext(deps=MockDeps()), ["long-task"])
+
+        assert "complete answer" in output
+        assert "truncated" not in output
+
+    @pytest.mark.anyio
+    async def test_custom_budget_is_honoured(self):
+        toolset, _ = self._toolset_with_result("b" * 100, max_result_chars=10)
+
+        wait_tool = toolset.tools["wait_tasks"]
+        output = await wait_tool.function(MockRunContext(deps=MockDeps()), ["long-task"])
+
+        assert "showing 10 of 100 characters" in output
+        assert "b" * 11 not in output
+
+    @pytest.mark.anyio
+    async def test_none_budget_returns_the_full_result(self):
+        toolset, _ = self._toolset_with_result("c" * 5000, max_result_chars=None)
+
+        wait_tool = toolset.tools["wait_tasks"]
+        output = await wait_tool.function(MockRunContext(deps=MockDeps()), ["long-task"])
+
+        assert "c" * 5000 in output
+        assert "truncated" not in output
+
+    @pytest.mark.anyio
+    async def test_truncation_keeps_the_chat_trace_line_intact(self):
+        """The trace id stays above the preview so continuation still parses."""
+        toolset, tm = self._toolset_with_result("d" * 2500)
+        tm.handles["long-task"].chat_trace_id = "trace-9"
+
+        wait_tool = toolset.tools["wait_tasks"]
+        output = await wait_tool.function(MockRunContext(deps=MockDeps()), ["long-task"])
+
+        assert "Chat Trace ID: trace-9\nddd" in output
+        assert "showing 2000 of 2500 characters" in output
+
+    @pytest.mark.anyio
+    async def test_check_task_returns_the_untruncated_result(self):
+        """check_task is the escape hatch the truncation marker points at."""
+        toolset, _ = self._toolset_with_result("e" * 2500)
+
+        check_tool = toolset.tools["check_task"]
+        output = await check_tool.function(MockRunContext(deps=MockDeps()), "long-task")
+
+        assert "e" * 2500 in output
+        assert "truncated" not in output
+
+    def test_negative_budget_is_rejected(self):
+        with pytest.raises(ValueError, match="max_result_chars must be >= 0 or None, got -1"):
+            create_subagent_toolset(default_model="test", max_result_chars=-1)

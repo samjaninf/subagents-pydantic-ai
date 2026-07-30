@@ -8,8 +8,12 @@ execution modes, with automatic mode selection based on task characteristics.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
+from collections import OrderedDict
+from collections.abc import Callable
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic_ai import Agent, RunContext, UsageLimits
@@ -52,6 +56,8 @@ from subagents_pydantic_ai.types import (
     decide_execution_mode,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _serialize_output(output: Any) -> str:
     """Serialize subagent output preserving structure for Pydantic models.
@@ -68,6 +74,149 @@ def _serialize_output(output: Any) -> str:
 
         return json.dumps(dataclasses.asdict(output), default=str)
     return str(output)
+
+
+def _capture_message_history(
+    result: Any,
+    on_message_history: Callable[[list[Any]], None] | None,
+) -> None:
+    """Capture a successful run's message history for a chat trace.
+
+    Best-effort, like `_capture_observability_best_effort`: a raising
+    `all_messages()` (or save callback) must never flip a successful run to
+    `FAILED`. On failure the previous saved history (if any) is kept, so a
+    continued trace resumes from the last successfully saved point.
+    """
+    if on_message_history is None:
+        return
+
+    try:
+        all_messages = getattr(result, "all_messages", None)
+        if all_messages is None:
+            return
+
+        messages: Any = all_messages()
+        if messages:
+            on_message_history(list(messages))
+    except Exception as e:
+        logger.warning("Failed to capture subagent message history: %s", e)
+
+
+def _get_result_traceparent(result: Any) -> str | None:
+    traceparent = getattr(result, "_traceparent", None)
+    if traceparent is None:
+        return None
+
+    value = traceparent(required=False)
+    return value if isinstance(value, str) and value else None
+
+
+def _iter_model_responses(result: Any) -> list[Any]:
+    responses: list[Any] = []
+    for message in result.all_messages():
+        if getattr(message, "kind", None) == "response":
+            responses.append(message)
+
+    try:
+        response = result.response
+    except (AttributeError, ValueError):
+        response = None
+    if response is not None and all(response is not item for item in responses):
+        responses.append(response)
+    return responses
+
+
+def _capture_result_observability(handle: TaskHandle, result: Any) -> None:
+    """Copy result observability onto a task handle."""
+    handle.usage = result.usage
+    handle.message_history = result.all_messages_json().decode()
+    handle.run_id = result.run_id
+    handle.conversation_id = result.conversation_id
+
+    handle.traceparent = _get_result_traceparent(result)
+    if handle.traceparent is not None:
+        parts = handle.traceparent.split("-")
+        if len(parts) >= 4:
+            handle.trace_id = parts[1]
+            handle.span_id = parts[2]
+
+    responses = _iter_model_responses(result)
+    if responses:
+        # Final response wins for per-run model/provider metadata: it is the
+        # model response that produced the returned output. In a multi-model
+        # run, earlier responses' model/provider metadata is not captured on
+        # the handle; aggregate fields such as `cost` and `tool_call_counts`
+        # are summed across all responses.
+        response = responses[-1]
+        handle.model_name = response.model_name
+        handle.provider_name = response.provider_name
+        handle.provider_url = response.provider_url
+        handle.provider_response_id = response.provider_response_id
+        handle.provider_details = response.provider_details
+        handle.finish_reason = response.finish_reason
+
+    total_cost = Decimal("0")
+    has_cost = False
+    tool_call_counts: dict[str, int] = {}
+    for response in responses:
+        if response.model_name:
+            try:
+                total_cost += response.cost().total_price
+                has_cost = True
+            except (AssertionError, LookupError):
+                pass
+
+        for tool_call in response.tool_calls:
+            tool_call_counts[tool_call.tool_name] = tool_call_counts.get(tool_call.tool_name, 0) + 1
+
+    handle.cost = total_cost if has_cost else None
+    handle.tool_call_counts = tool_call_counts
+
+
+def _capture_observability_best_effort(handle: TaskHandle, result: Any) -> None:
+    """Capture telemetry without ever failing the task.
+
+    Observability is best-effort (matching pydantic-ai's own instrumentation,
+    which warns on cost/serialization failures rather than propagating). A run
+    that succeeded must not be reported as ``FAILED`` just because a result
+    object lacks an attribute or telemetry collection raised.
+    """
+    try:
+        _capture_result_observability(handle, result)
+    except Exception as e:
+        logger.warning("Failed to capture subagent observability: %s", e)
+
+
+def _format_chat_trace_result(output: str, chat_trace_id: str) -> str:
+    """Append a compact chat trace identifier to a subagent result."""
+    return f"{output}\n\nChat Trace ID: {chat_trace_id}"
+
+
+def _preview_result(result: str, task_id: str, max_chars: int | None) -> str:
+    """Render a task result for `wait_tasks`, marking truncation explicitly.
+
+    A silent cut reads to the orchestrator like a subagent that stopped
+    mid-sentence, so it "recovers" by re-delegating the same work. The marker
+    states that the cut is ours, that the stored answer is complete, and which
+    tool returns the untruncated text.
+
+    Args:
+        result: The subagent's full result text.
+        task_id: Task ID the orchestrator passes to `check_task` for the rest.
+        max_chars: Preview budget in characters; `None` disables truncation.
+
+    Returns:
+        The result unchanged when it fits the budget, otherwise the first
+        `max_chars` characters followed by the truncation marker.
+    """
+    if max_chars is None or len(result) <= max_chars:
+        return result
+    return (
+        f"{result[:max_chars]}\n\n"
+        f"[Result truncated for display: showing {max_chars} of {len(result)} characters. "
+        f"The subagent's answer is complete and stored in full. "
+        f"Call check_task('{task_id}') to read all of it.]"
+    )
 
 
 async def _drain_steering_messages(message_bus: InMemoryMessageBus, agent_id: str) -> list[str]:
@@ -239,84 +388,6 @@ def _create_ask_parent_toolset() -> FunctionToolset[Any]:
     return toolset
 
 
-async def _execute_compiled_subagent(
-    ctx: RunContext[SubAgentDepsProtocol],
-    subagent: CompiledSubAgent,
-    description: str,
-    *,
-    mode: ExecutionMode,
-    priority: TaskPriority,
-    complexity: Literal["simple", "moderate", "complex"] | None,
-    requires_user_context: bool,
-    may_need_clarification: bool,
-    max_nesting_depth: int,
-    toolsets_factory: ToolsetFactory | None,
-    ask_user: AskUserCallback | None,
-    usage_limits: UsageLimits | UsageLimitsFactory | None,
-    task_manager: TaskManager,
-    message_bus: InMemoryMessageBus,
-    inject_ask_parent: bool = False,
-    task_id: str | None = None,
-) -> str:
-    """Run a compiled subagent synchronously or asynchronously."""
-    config = subagent.config
-    agent = subagent.agent
-
-    if agent is None:
-        return f"Error: Subagent '{subagent.name}' is not properly initialized"
-
-    resolved_usage_limits = usage_limits(ctx, config) if callable(usage_limits) else usage_limits
-
-    parent_deps = ctx.deps
-    subagent_deps = parent_deps.clone_for_subagent(max_nesting_depth - 1)
-
-    runtime_toolsets: list[Any] | None = None
-    if toolsets_factory or inject_ask_parent:
-        runtime_toolsets = []
-        if inject_ask_parent and config.get("can_ask_questions", True):
-            runtime_toolsets.append(_create_ask_parent_toolset())
-        if toolsets_factory:
-            runtime_toolsets.extend(toolsets_factory(subagent_deps))
-
-    actual_task_id = task_id or str(uuid.uuid4())[:8]
-
-    if mode == "auto":
-        characteristics = TaskCharacteristics(
-            estimated_complexity=complexity or config.get("typical_complexity", "moderate"),
-            requires_user_context=requires_user_context
-            or config.get("typically_needs_context", False),
-            may_need_clarification=may_need_clarification,
-        )
-        resolved_mode = decide_execution_mode(characteristics, config)
-    else:
-        resolved_mode = mode
-
-    if resolved_mode == "sync":
-        return await _run_sync(
-            agent=agent,
-            config=config,
-            description=description,
-            deps=subagent_deps,
-            task_id=actual_task_id,
-            extra_toolsets=runtime_toolsets,
-            ask_user=ask_user,
-            usage_limits=resolved_usage_limits,
-        )
-
-    return await _run_async(
-        agent=agent,
-        config=config,
-        description=description,
-        deps=subagent_deps,
-        task_id=actual_task_id,
-        task_manager=task_manager,
-        message_bus=message_bus,
-        extra_toolsets=runtime_toolsets,
-        priority=priority,
-        usage_limits=resolved_usage_limits,
-    )
-
-
 def create_subagent_toolset(  # noqa: C901
     subagents: list[SubAgentConfig] | None = None,
     default_model: str | Model = "openai:gpt-4.1",
@@ -333,6 +404,9 @@ def create_subagent_toolset(  # noqa: C901
     capabilities_map: dict[str, CapabilityFactory] | None = None,
     default_agent_factory: Any | None = None,
     max_agents: int = 10,
+    max_chat_traces: int = 100,
+    max_task_handles: int = 500,
+    max_result_chars: int | None = 2000,
 ) -> FunctionToolset[Any]:
     """Create a toolset for delegating tasks to subagents.
 
@@ -390,9 +464,29 @@ def create_subagent_toolset(  # noqa: C901
             Do not attach an `ask_parent` toolset in the factory; the toolset
             injects it at run time when needed.
         max_agents: Maximum number of persistent dynamic agents.
+        max_chat_traces: Maximum number of chat traces (subagent conversations)
+            whose message history is kept in memory for continuation via
+            `chat_trace_id`. Least-recently-used traces are evicted past this
+            limit; continuing an evicted trace returns an error. Bounds memory
+            in long-lived sessions.
+        max_task_handles: Maximum number of finished (completed/failed/cancelled)
+            task handles retained for status queries and observability. The
+            oldest finished handles are evicted past this limit; their token
+            usage is folded into `get_total_usage()` totals so aggregates stay
+            correct. Bounds memory in long-lived sessions.
+        max_result_chars: Character budget for a completed task's result in the
+            `wait_tasks` listing, keeping a fan-out of verbose subagents from
+            flooding the orchestrator's context. Results past the budget are cut
+            and carry an explicit marker pointing at `check_task`, which always
+            returns the full text. Pass `None` to never truncate.
 
     Returns:
         FunctionToolset configured with subagent management tools.
+
+    Raises:
+        ValueError: If `max_result_chars` is negative, or
+            `delegation_configuration` is invalid, or
+            `oneshot_only` is combined with non-empty `subagents`.
 
     Example:
         ```python
@@ -435,6 +529,9 @@ def create_subagent_toolset(  # noqa: C901
             "Omit subagents, or use a mode that exposes the task tool."
         )
 
+    if max_result_chars is not None and max_result_chars < 0:
+        raise ValueError(f"max_result_chars must be >= 0 or None, got {max_result_chars}")
+
     _descs = descriptions or {}
     active_registry: Any = (
         registry if registry is not None else DynamicAgentRegistry(max_agents=max_agents)
@@ -453,6 +550,33 @@ def create_subagent_toolset(  # noqa: C901
     # Create shared state
     message_bus = InMemoryMessageBus()
     task_manager = TaskManager(message_bus=message_bus)
+    # LRU-ordered: oldest chat trace first, evicted past max_chat_traces.
+    message_history_store: OrderedDict[tuple[str, str], list[Any]] = OrderedDict()
+    # Chat traces with a task currently running — a trace must finish before
+    # it can be continued, otherwise concurrent saves would lose history.
+    active_chat_traces: set[tuple[str, str]] = set()
+    # Usage from evicted handles, so get_total_usage() survives eviction.
+    evicted_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "requests": 0}
+
+    _terminal_statuses = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+
+    def evict_finished_handles() -> None:
+        """Drop the oldest finished handles past `max_task_handles`.
+
+        Running/waiting tasks are never evicted. Evicted usage is accumulated
+        into `evicted_usage` so `get_total_usage()` stays correct.
+        """
+        finished = [h for h in task_manager.handles.values() if h.status in _terminal_statuses]
+        overflow = len(finished) - max_task_handles
+        if overflow <= 0:
+            return
+        finished.sort(key=lambda h: h.completed_at or h.created_at)
+        for old in finished[:overflow]:
+            if old.usage is not None:
+                evicted_usage["input_tokens"] += getattr(old.usage, "input_tokens", 0)
+                evicted_usage["output_tokens"] += getattr(old.usage, "output_tokens", 0)
+                evicted_usage["requests"] += getattr(old.usage, "requests", 0)
+            task_manager.handles.pop(old.task_id, None)
 
     # Build dynamic task description with available subagents
     subagent_list = "\n".join(f"- {name}: {c.description}" for name, c in compiled.items())
@@ -481,6 +605,135 @@ def create_subagent_toolset(  # noqa: C901
         "persisted_and_oneshot",
         "oneshot_only",
     }
+
+    async def execute_compiled_subagent(
+        ctx: RunContext[SubAgentDepsProtocol],
+        subagent: CompiledSubAgent,
+        description: str,
+        *,
+        mode: ExecutionMode,
+        priority: TaskPriority,
+        complexity: Literal["simple", "moderate", "complex"] | None,
+        requires_user_context: bool,
+        may_need_clarification: bool,
+        inject_ask_parent: bool = False,
+        task_id: str | None = None,
+        chat_trace_id: str | None = None,
+    ) -> str:
+        """Run a compiled subagent with chat-trace and observability support."""
+        config = subagent.config
+        agent = subagent.agent
+
+        if agent is None:
+            return f"Error: Subagent '{subagent.name}' is not properly initialized"
+
+        resolved_usage_limits = (
+            usage_limits(ctx, config) if callable(usage_limits) else usage_limits
+        )
+
+        parent_deps = ctx.deps
+        subagent_deps = parent_deps.clone_for_subagent(max_nesting_depth - 1)
+
+        runtime_toolsets: list[Any] | None = None
+        if toolsets_factory or inject_ask_parent:
+            runtime_toolsets = []
+            if inject_ask_parent and config.get("can_ask_questions", True):
+                runtime_toolsets.append(_create_ask_parent_toolset())
+            if toolsets_factory:
+                runtime_toolsets.extend(toolsets_factory(subagent_deps))
+
+        actual_task_id = task_id or str(uuid.uuid4())[:8]
+
+        effective_chat_trace_id = chat_trace_id or uuid.uuid4().hex
+        chat_trace_key = (config["name"], effective_chat_trace_id)
+        if chat_trace_key in active_chat_traces:
+            return (
+                f"Error: chat trace '{effective_chat_trace_id}' already has a running "
+                f"task on subagent '{config['name']}'. Wait for it to finish "
+                f"(check_task/wait_tasks) before continuing this conversation."
+            )
+        message_history = message_history_store.get(chat_trace_key)
+        if message_history is not None:
+            message_history_store.move_to_end(chat_trace_key)
+        elif chat_trace_id is not None:
+            return (
+                f"Error: no saved conversation for chat_trace_id '{chat_trace_id}' "
+                f"with subagent '{config['name']}' (unknown, evicted, or its first "
+                f"run failed). Omit chat_trace_id to start a new conversation."
+            )
+
+        def save_message_history(messages: list[Any]) -> None:
+            message_history_store[chat_trace_key] = messages
+            message_history_store.move_to_end(chat_trace_key)
+            while len(message_history_store) > max_chat_traces:
+                message_history_store.popitem(last=False)
+
+        evict_finished_handles()
+
+        if mode == "auto":
+            characteristics = TaskCharacteristics(
+                estimated_complexity=complexity or config.get("typical_complexity", "moderate"),
+                requires_user_context=requires_user_context
+                or config.get("typically_needs_context", False),
+                may_need_clarification=may_need_clarification,
+            )
+            resolved_mode = decide_execution_mode(characteristics, config)
+        else:
+            resolved_mode = mode
+
+        if resolved_mode == "sync":
+            handle = TaskHandle(
+                task_id=actual_task_id,
+                subagent_name=config["name"],
+                description=description,
+                status=TaskStatus.RUNNING,
+                priority=priority,
+                chat_trace_id=effective_chat_trace_id,
+                started_at=datetime.now(),
+            )
+            task_manager.handles[actual_task_id] = handle
+            active_chat_traces.add(chat_trace_key)
+            try:
+                result = await _run_sync(
+                    agent=agent,
+                    config=config,
+                    description=description,
+                    deps=subagent_deps,
+                    task_id=actual_task_id,
+                    extra_toolsets=runtime_toolsets,
+                    ask_user=ask_user,
+                    usage_limits=resolved_usage_limits,
+                    handle=handle,
+                    message_history=message_history,
+                    on_message_history=save_message_history,
+                )
+            finally:
+                active_chat_traces.discard(chat_trace_key)
+            if handle.status != TaskStatus.FAILED or chat_trace_key in message_history_store:
+                return _format_chat_trace_result(result, effective_chat_trace_id)
+            return result
+
+        active_chat_traces.add(chat_trace_key)
+        try:
+            return await _run_async(
+                agent=agent,
+                config=config,
+                description=description,
+                deps=subagent_deps,
+                task_id=actual_task_id,
+                task_manager=task_manager,
+                message_bus=message_bus,
+                extra_toolsets=runtime_toolsets,
+                priority=priority,
+                usage_limits=resolved_usage_limits,
+                chat_trace_id=effective_chat_trace_id,
+                message_history=message_history,
+                on_message_history=save_message_history,
+                on_run_finished=lambda: active_chat_traces.discard(chat_trace_key),
+            )
+        except BaseException:
+            active_chat_traces.discard(chat_trace_key)
+            raise
 
     if expose_create_agent:
         create_agent_description = _descs.get(
@@ -548,6 +801,7 @@ def create_subagent_toolset(  # noqa: C901
             complexity: Literal["simple", "moderate", "complex"] | None = None,
             requires_user_context: bool = False,
             may_need_clarification: bool = False,
+            chat_trace_id: str | None = None,
         ) -> str:
             """Delegate a task to a specialized subagent.
 
@@ -560,8 +814,10 @@ def create_subagent_toolset(  # noqa: C901
                 complexity: Override complexity estimate ("simple", "moderate", "complex").
                 requires_user_context: Whether task needs ongoing user interaction.
                 may_need_clarification: Whether task might need clarifying questions.
+                chat_trace_id: Optional explicit chat trace ID. When omitted, a new subagent
+                    conversation is created. When provided, this subagent resumes from
+                    the previous successful task with the same chat trace.
             """
-            # Validate subagent_type — check static compiled dict first, then dynamic registry
             if subagent_type in compiled:
                 subagent = compiled[subagent_type]
                 inject_ask_parent = False
@@ -574,7 +830,7 @@ def create_subagent_toolset(  # noqa: C901
                 available = ", ".join(available_names)
                 return f"Error: Unknown subagent '{subagent_type}'. Available: {available}"
 
-            return await _execute_compiled_subagent(
+            return await execute_compiled_subagent(
                 ctx,
                 subagent,
                 description,
@@ -583,13 +839,8 @@ def create_subagent_toolset(  # noqa: C901
                 complexity=complexity,
                 requires_user_context=requires_user_context,
                 may_need_clarification=may_need_clarification,
-                max_nesting_depth=max_nesting_depth,
-                toolsets_factory=toolsets_factory,
-                ask_user=ask_user,
-                usage_limits=usage_limits,
-                task_manager=task_manager,
-                message_bus=message_bus,
                 inject_ask_parent=inject_ask_parent,
+                chat_trace_id=chat_trace_id,
             )
 
     if expose_delegate:
@@ -644,7 +895,7 @@ def create_subagent_toolset(  # noqa: C901
                 config=config,
             )
 
-            return await _execute_compiled_subagent(
+            return await execute_compiled_subagent(
                 ctx,
                 subagent,
                 description,
@@ -653,12 +904,6 @@ def create_subagent_toolset(  # noqa: C901
                 complexity=complexity,
                 requires_user_context=requires_user_context,
                 may_need_clarification=may_need_clarification,
-                max_nesting_depth=max_nesting_depth,
-                toolsets_factory=toolsets_factory,
-                ask_user=ask_user,
-                usage_limits=usage_limits,
-                task_manager=task_manager,
-                message_bus=message_bus,
                 inject_ask_parent=True,
                 task_id=task_id,
             )
@@ -684,14 +929,13 @@ def create_subagent_toolset(  # noqa: C901
             f"Status: {handle.status}",
             f"Description: {handle.description}",
         ]
+        # Only advertise continuation for completed tasks — a failed or still
+        # running task has not saved this run's history yet (matches wait_tasks).
+        if handle.chat_trace_id is not None and handle.status == TaskStatus.COMPLETED:
+            status_info.append(f"Chat Trace ID: {handle.chat_trace_id}")
 
         if handle.status == TaskStatus.COMPLETED:
             status_info.append(f"Result: {handle.result}")
-            if handle.usage is not None:
-                u = handle.usage
-                inp = getattr(u, "input_tokens", 0)
-                out = getattr(u, "output_tokens", 0)
-                status_info.append(f"Usage: {inp + out} tokens ({inp} in / {out} out)")
         elif handle.status == TaskStatus.FAILED:
             status_info.append(f"Error: {handle.error}")
         elif handle.status == TaskStatus.WAITING_FOR_ANSWER:
@@ -842,8 +1086,14 @@ def create_subagent_toolset(  # noqa: C901
             status = handle.status
             if status == "completed":
                 finished_count += 1
-                result_preview = (handle.result or "")[:2000]
-                lines.append(f"- {tid} ({handle.subagent_name}): COMPLETED\n{result_preview}")
+                result_preview = _preview_result(handle.result or "", tid, max_result_chars)
+                chat_trace_line = ""
+                if handle.chat_trace_id is not None:
+                    chat_trace_line = f"Chat Trace ID: {handle.chat_trace_id}\n"
+                lines.append(
+                    f"- {tid} ({handle.subagent_name}): COMPLETED\n"
+                    f"{chat_trace_line}{result_preview}"
+                )
             elif status == "failed":
                 finished_count += 1
                 lines.append(f"- {tid} ({handle.subagent_name}): FAILED - {handle.error}")
@@ -896,6 +1146,7 @@ def create_subagent_toolset(  # noqa: C901
 
     # Expose task_manager for external monitoring (e.g., push notifications)
     toolset.task_manager = task_manager  # type: ignore[attr-defined]
+    toolset.message_history_store = message_history_store  # type: ignore[attr-defined]
 
     def get_total_usage() -> dict[str, int]:
         """Get aggregate token usage across all completed subagent tasks.
@@ -903,10 +1154,10 @@ def create_subagent_toolset(  # noqa: C901
         Returns dict with `input_tokens`, `output_tokens`, `total_tokens`, `requests`.
         """
         totals: dict[str, int] = {
-            "input_tokens": 0,
-            "output_tokens": 0,
+            "input_tokens": evicted_usage["input_tokens"],
+            "output_tokens": evicted_usage["output_tokens"],
             "total_tokens": 0,
-            "requests": 0,
+            "requests": evicted_usage["requests"],
         }
         for handle in task_manager.list_handles():
             if handle.usage is not None:
@@ -930,6 +1181,9 @@ async def _run_sync(
     extra_toolsets: list[Any] | None = None,
     ask_user: AskUserCallback | None = None,
     usage_limits: UsageLimits | None = None,
+    handle: TaskHandle | None = None,
+    message_history: list[Any] | None = None,
+    on_message_history: Callable[[list[Any]], None] | None = None,
 ) -> str:
     """Run a subagent task synchronously (blocking).
 
@@ -947,6 +1201,10 @@ async def _run_sync(
             its run loop is blocked here.
         usage_limits: Optional pydantic-ai usage limits forwarded to the
             subagent run (honoured on every retry attempt).
+        handle: Optional task handle populated for Python-side observability.
+        message_history: Optional prior message history for a subagent chat trace.
+        on_message_history: Optional callback that receives the successful
+            run's full message history.
 
     Returns:
         The subagent's response.
@@ -970,6 +1228,10 @@ async def _run_sync(
         run_kwargs["toolsets"] = extra_toolsets
     if usage_limits is not None:
         run_kwargs["usage_limits"] = usage_limits
+    if message_history is not None:
+        run_kwargs["message_history"] = message_history
+    if handle is not None and handle.chat_trace_id is not None:
+        run_kwargs["conversation_id"] = handle.chat_trace_id
 
     try:
         result = await run_with_retry(
@@ -978,8 +1240,22 @@ async def _run_sync(
             run_kwargs=run_kwargs,
             retry=RetryConfig.from_config(config),
         )
-        return _serialize_output(result.output)
+        _capture_message_history(result, on_message_history)
+        output = _serialize_output(result.output)
+        if handle is not None:
+            handle.result = output
+            handle.error = None
+            handle.status = TaskStatus.COMPLETED
+            handle.completed_at = datetime.now()
+            # Telemetry is best-effort and runs after the run is marked complete,
+            # so a capture failure can never flip a successful run to FAILED.
+            _capture_observability_best_effort(handle, result)
+        return output
     except Exception as e:
+        if handle is not None:
+            handle.status = TaskStatus.FAILED
+            handle.error = str(e)
+            handle.completed_at = datetime.now()
         return f"Error executing task: {e}"
 
 
@@ -994,6 +1270,10 @@ async def _run_async(
     priority: TaskPriority = TaskPriority.NORMAL,
     extra_toolsets: list[Any] | None = None,
     usage_limits: UsageLimits | None = None,
+    chat_trace_id: str | None = None,
+    message_history: list[Any] | None = None,
+    on_message_history: Callable[[list[Any]], None] | None = None,
+    on_run_finished: Callable[[], None] | None = None,
 ) -> str:
     """Run a subagent task asynchronously (background).
 
@@ -1009,6 +1289,14 @@ async def _run_async(
         extra_toolsets: Additional toolsets to pass to agent.run().
         usage_limits: Optional pydantic-ai usage limits forwarded to the
             subagent run (honoured on every retry attempt).
+        chat_trace_id: Optional chat trace ID for continuing this subagent
+            conversation.
+        message_history: Optional prior message history for a subagent chat trace.
+        on_message_history: Optional callback that receives the successful
+            run's full message history.
+        on_run_finished: Optional callback invoked exactly once when the
+            background run finishes (completed, failed, or cancelled). Used to
+            release the chat trace for continuation.
 
     Returns:
         Task handle information as string.
@@ -1020,6 +1308,7 @@ async def _run_async(
         description=description,
         status=TaskStatus.PENDING,
         priority=priority,
+        chat_trace_id=chat_trace_id,
     )
 
     # Register subagent for messaging
@@ -1051,6 +1340,10 @@ async def _run_async(
             run_kwargs["toolsets"] = extra_toolsets
         if usage_limits is not None:
             run_kwargs["usage_limits"] = usage_limits
+        if message_history is not None:
+            run_kwargs["message_history"] = message_history
+        if chat_trace_id is not None:
+            run_kwargs["conversation_id"] = chat_trace_id
 
         def _on_retry(attempt: int, exc: BaseException, delay: float) -> None:
             handle.status = TaskStatus.RETRYING
@@ -1078,14 +1371,13 @@ async def _run_async(
                 cancel_check=_cancel_requested,
                 inject_messages=_pending_steering,
             )
+            _capture_message_history(result, on_message_history)
             handle.result = _serialize_output(result.output)
             handle.error = None
-            if hasattr(result, "usage"):
-                # pydantic-ai 2.0 made `usage` a property (was a method); calling
-                # it raises "'RunUsage' object is not callable" and would flip a
-                # successful run to FAILED.
-                handle.usage = result.usage
             handle.status = TaskStatus.COMPLETED
+            # Telemetry is best-effort and runs after the run is marked complete,
+            # so a capture failure can never flip a successful run to FAILED.
+            _capture_observability_best_effort(handle, result)
         except asyncio.CancelledError:
             handle.status = TaskStatus.CANCELLED
             handle.error = "Task was cancelled"
@@ -1097,16 +1389,17 @@ async def _run_async(
             message_bus.unregister_agent(agent_id)
             task_manager.clear_answer_future(task_id)
             task_manager.cleanup_task(task_id)
+            if on_run_finished is not None:
+                on_run_finished()
 
     # Create the background task
     task_manager.create_task(task_id, run_task(), handle)
 
-    return (
-        f"Task started in background.\n"
-        f"Task ID: {task_id}\n"
-        f"Subagent: {config['name']}\n"
-        f"Use check_task('{task_id}') to check status."
-    )
+    response = f"Task started in background.\nTask ID: {task_id}\nSubagent: {config['name']}\n"
+    if chat_trace_id is not None:
+        response += f"Chat Trace ID: {chat_trace_id}\n"
+    response += f"Use check_task('{task_id}') to check status."
+    return response
 
 
 # Alias for backwards compatibility

@@ -20,6 +20,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Registry-backed agents now receive `ask_parent` at run time.** Dynamic agents created via the registry previously lacked the `ask_parent` toolset that statically compiled subagents get, so `can_ask_questions` was effectively a no-op for them. The toolset now injects `ask_parent` when executing registry-backed (and one-shot) agents. Custom `default_agent_factory` implementations should not attach their own `ask_parent` toolset, or the tool name will be duplicated at run time.
 
+## [0.2.10] - 2026-07-24
+
+### Fixed
+
+- **`wait_tasks` truncated results silently, making orchestrators re-delegate finished work** ([#55](https://github.com/vstorm-co/subagents-pydantic-ai/issues/55)). A completed task's result was hard-sliced to 2000 characters with no ellipsis, length, or marker of any kind. The orchestrator saw a well-formed answer that stopped mid-sentence, concluded the subagent had been cut off, and dispatched a *new* task asking it to finish — burning a full extra round-trip on work that was already complete and stored intact. Truncated results now end with an explicit marker stating that the cut is a display limit, that the stored answer is complete, and which `check_task(...)` call returns the full text; `check_task` and the `wait_tasks` tool description say the same, so the orchestrator knows the rule before it ever meets a cut result.
+
+### Added
+
+- **`max_result_chars` on `create_subagent_toolset` and `SubAgentCapability`** (default `2000`, matching the previous hard-coded limit). Sets the per-result character budget in the `wait_tasks` listing, so a fan-out of verbose subagents can't flood the orchestrator's context. Pass `None` to never truncate; a negative value raises `ValueError`.
+
+## [0.2.9] - 2026-07-19
+
+### Added
+
+- **Stateful subagent conversations via `chat_trace_id`** ([#44](https://github.com/vstorm-co/subagents-pydantic-ai/pull/44)). Every successful `task()` result now ends with a `Chat Trace ID: <id>` line; passing that ID back to `task()` resumes the same subagent conversation with its full message history (stored per `(subagent_name, chat_trace_id)`). Guard rails: a trace can only be continued once its current task has finished (continuing a busy trace returns an error instead of racing and losing one branch of history), continuing an unknown/evicted trace returns an error instead of silently starting a fresh conversation, and a failed first run does not advertise a trace ID. The store is LRU-bounded by the new `max_chat_traces` parameter on `create_subagent_toolset` (default 100) so long-lived sessions don't grow memory without bound.
+- **Rich per-task observability on `TaskHandle`** ([#44](https://github.com/vstorm-co/subagents-pydantic-ai/pull/44)). Both sync and async runs now populate the handle with `usage` (including provider detail counters), `message_history` (JSON), `run_id`, `conversation_id`, `traceparent`/`trace_id`/`span_id`, final-response `model_name`/`provider_name`/`provider_url`/`provider_response_id`/`provider_details`/`finish_reason`, summed `cost` (via genai-prices), and `tool_call_counts`. Capture is best-effort by design: the run is marked `COMPLETED` before telemetry is collected, and any capture failure (including message-history capture) logs a warning instead of flipping a successful run to `FAILED`. Sync tasks now register handles too, so `get_total_usage()` finally includes sync runs. Retained finished handles are bounded by the new `max_task_handles` parameter (default 500); evicted handles fold their token usage into `get_total_usage()` totals so aggregates stay correct.
+
+### Changed
+
+- **`check_task()` and `wait_tasks()` no longer embed usage details in tool-return text.** Observability data lives on the `TaskHandle` (inspect `toolset.task_manager`) instead of being fed back into the parent's context. `check_task` shows the `Chat Trace ID` only for completed tasks, matching `wait_tasks`, so continuation is never advertised for a run whose history was not saved.
+
+### Documentation
+
+- **Brand refresh** ([#48](https://github.com/vstorm-co/subagents-pydantic-ai/pull/48)): new social preview card, Pydantic favicon/logo in mkdocs, unified README header with the "Part of Pydantic Deep Agents" callout and Vstorm OSS ecosystem section.
+- New "Stateful conversations (`chat_trace_id`)" section in `docs/concepts/toolset.md`, plus the `max_chat_traces` / `max_task_handles` factory parameters.
+
 ## [0.2.8] - 2026-06-26
 
 ### Fixed
@@ -29,13 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Require `pydantic-ai-slim>=2.0`** (was `>=1.74.0`): the package now targets the 2.0 API (`result.usage` property; context-less tools registered via `tool_plain`, which 2.0 made a hard requirement rather than a deprecation).
-
-## [0.2.7] - 2026-06-04
-
-### Added
-
-- **Unprompted parent -> child steering via `send_message_to_subagent`** ([#28](https://github.com/vstorm-co/subagents-pydantic-ai/issues/28)). A parent agent can now steer a running **async** subagent mid-flight without cancelling it — e.g. "narrow the search to `packages/sparta/`, it isn't in `core/`" — so the subagent adapts on its next step while keeping all partial progress, instead of the lossy cancel-and-respawn pattern. The new `send_message_to_subagent(task_id, message)` tool enqueues a `TASK_UPDATE` on the message bus for `subagent-{task_id}`; the run loop drains it at the next model-request boundary (`_drive_run` gained an `inject_messages` hook alongside the existing `cancel_check`) and folds each message into that request as an extra `UserPromptPart`. Injecting only at model-request boundaries guarantees a steering part is never spliced into a tool-call/tool-return pair. This is distinct from `answer_subagent`, which only replies to a question the subagent already asked via `ask_parent`. Sending to a finished or unknown task returns a clear error. Honoured on the retry-driven run path (`max_retries > 0`, the default); the legacy `agent.run()` fast path (`max_retries == 0`) does not expose node boundaries, so steering messages stay queued there.
-
 ## [0.2.6] - 2026-06-01
 
 ### Changed
