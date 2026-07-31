@@ -395,25 +395,33 @@ toolset = create_subagent_toolset(
 )
 ```
 
-## General Purpose Subagent
+## General-purpose subagent
 
-By default, a "general" subagent is added for tasks that don't match specific subagents:
+A `general-purpose` subagent is added by default, so the model has somewhere to
+send work that matches none of your specialists. Turn it off when you want the
+model restricted to the subagents you defined:
 
 ```python
-# Customize the general subagent
 toolset = create_subagent_toolset(
     subagents=subagents,
-    general_purpose_config=SubAgentConfig(
-        name="general",
-        description="Handles miscellaneous tasks",
-        instructions="You are a general-purpose assistant.",
-    ),
+    include_general_purpose=False,
 )
+```
 
-# Disable the general subagent
+To replace it rather than remove it, disable the built-in one and define your own
+with whatever instructions you want:
+
+```python
 toolset = create_subagent_toolset(
-    subagents=subagents,
-    general_purpose_config=None,
+    subagents=[
+        *subagents,
+        SubAgentConfig(
+            name="general",
+            description="Handles miscellaneous tasks",
+            instructions="You are a general-purpose assistant.",
+        ),
+    ],
+    include_general_purpose=False,
 )
 ```
 

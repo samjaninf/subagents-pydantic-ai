@@ -270,7 +270,7 @@ if research_complete:
 
 Ensure each agent has what it needs:
 
-```python
+```text
 # Bad: Vague handoff
 task(description="Analyze the stuff", ...)
 

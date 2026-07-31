@@ -31,10 +31,12 @@ class TestMessageType:
         assert MessageType.CANCEL_REQUEST == "cancel_request"
         assert MessageType.CANCEL_FORCED == "cancel_forced"
 
-    def test_message_type_is_string(self):
-        """MessageType should be usable as a string."""
+    def test_message_type_renders_as_its_value(self):
+        """MessageType renders as its value, not as `ClassName.MEMBER`."""
         assert isinstance(MessageType.TASK_ASSIGNED.value, str)
-        assert str(MessageType.TASK_ASSIGNED) == "MessageType.TASK_ASSIGNED"
+        assert str(MessageType.TASK_ASSIGNED) == "task_assigned"
+        assert f"{MessageType.TASK_ASSIGNED}" == "task_assigned"
+        assert f"{MessageType.TASK_ASSIGNED:>15}" == "  task_assigned"
 
 
 class TestTaskStatus:
@@ -225,10 +227,11 @@ class TestTaskPriority:
         assert TaskPriority.HIGH == "high"
         assert TaskPriority.CRITICAL == "critical"
 
-    def test_priority_is_string(self):
-        """TaskPriority should be usable as a string."""
+    def test_priority_renders_as_its_value(self):
+        """TaskPriority renders as its value, not as `ClassName.MEMBER`."""
         assert isinstance(TaskPriority.NORMAL.value, str)
-        assert str(TaskPriority.NORMAL) == "TaskPriority.NORMAL"
+        assert str(TaskPriority.NORMAL) == "normal"
+        assert f"{TaskPriority.NORMAL}" == "normal"
 
 
 class TestTaskCharacteristics:

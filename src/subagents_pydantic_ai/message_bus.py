@@ -1,20 +1,28 @@
-"""Message bus implementations for inter-agent communication.
+"""Message bus and background-task bookkeeping for subagent delegation.
 
-This module provides message bus implementations that enable communication
-between parent agents and subagents. The default implementation uses
-asyncio queues for in-memory communication.
+`TaskManager` owns the lifecycle of background (async-mode) delegations:
+the `asyncio.Task` running each one, its `TaskHandle`, its cancellation event,
+and the future a blocked `ask_parent` is waiting on.
+
+`InMemoryMessageBus` carries parent-to-child steering messages. Its
+request-response half (`ask`, `answer`, handlers) is not used by the toolset; it
+exists as an extension point for applications that want to drive the bus
+themselves, or to back a different transport behind `MessageBusProtocol`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any
 
-from subagents_pydantic_ai.types import AgentMessage, MessageType, TaskStatus
+from subagents_pydantic_ai.types import AgentMessage, MessageType, TaskHandle, TaskStatus, utcnow
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -65,12 +73,14 @@ class InMemoryMessageBus:
 
         await self._queues[message.receiver].put(message)
 
-        # Notify handlers
         for handler in self._handlers:
+            # Handlers are observers (logging, tracing). One that raises must not
+            # stop delivery to the others or fail the send, but it is logged
+            # rather than discarded.
             try:
                 await handler(message)
-            except Exception:  # pragma: no cover
-                pass  # Don't let handler errors break message delivery
+            except Exception as e:
+                logger.warning("Message bus handler %r failed: %s", handler, e)
 
     async def ask(
         self,
@@ -101,13 +111,10 @@ class InMemoryMessageBus:
 
         correlation_id = str(uuid.uuid4())
 
-        # Create future for the response
-        loop = asyncio.get_event_loop()
-        response_future: asyncio.Future[AgentMessage] = loop.create_future()
+        response_future: asyncio.Future[AgentMessage] = asyncio.get_running_loop().create_future()
         self._pending_questions[correlation_id] = response_future
 
         try:
-            # Send the question
             message = AgentMessage(
                 type=MessageType.QUESTION,
                 sender=sender,
@@ -118,10 +125,8 @@ class InMemoryMessageBus:
             )
             await self.send(message)
 
-            # Wait for response
             return await asyncio.wait_for(response_future, timeout=timeout)
         finally:
-            # Clean up
             self._pending_questions.pop(correlation_id, None)
 
     async def answer(self, original: AgentMessage, answer: Any) -> None:
@@ -147,13 +152,11 @@ class InMemoryMessageBus:
             correlation_id=original.correlation_id,
         )
 
-        # If there's a pending future for this correlation_id, resolve it
         if original.correlation_id and original.correlation_id in self._pending_questions:
             future = self._pending_questions[original.correlation_id]
             if not future.done():
                 future.set_result(response)
         else:
-            # Otherwise, put in queue
             await self.send(response)
 
     def register_agent(self, agent_id: str) -> asyncio.Queue[AgentMessage]:
@@ -247,7 +250,6 @@ class InMemoryMessageBus:
         queue = self._queues[agent_id]
         messages: list[AgentMessage] = []
 
-        # If timeout > 0 and queue is empty, wait for first message
         if timeout > 0 and queue.empty():
             try:
                 msg = await asyncio.wait_for(queue.get(), timeout=timeout)
@@ -255,7 +257,6 @@ class InMemoryMessageBus:
             except asyncio.TimeoutError:
                 return messages
 
-        # Drain all available messages
         while not queue.empty():
             try:
                 msg = queue.get_nowait()
@@ -305,23 +306,26 @@ class TaskManager:
     status querying capabilities.
 
     Attributes:
-        tasks: Dictionary of task_id -> asyncio.Task
-        handles: Dictionary of task_id -> TaskHandle
-        message_bus: Message bus for communication
+        tasks: Live `asyncio.Task` per task id. An entry is removed by
+            `cleanup_task` when the task finishes.
+        handles: `TaskHandle` per task id, kept after the task finishes so its
+            result and telemetry stay queryable.
+        message_bus: Message bus used to deliver steering and cancel messages.
     """
 
-    tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
-    handles: dict[str, Any] = field(default_factory=dict)  # TaskHandle
+    tasks: dict[str, asyncio.Task[None]] = field(default_factory=dict)
+    handles: dict[str, TaskHandle] = field(default_factory=dict)
     message_bus: InMemoryMessageBus = field(default_factory=InMemoryMessageBus)
     _cancel_events: dict[str, asyncio.Event] = field(default_factory=dict)
     _answer_futures: dict[str, asyncio.Future[str]] = field(default_factory=dict)
+    _strong_refs: set[asyncio.Task[None]] = field(default_factory=set)
 
     def create_task(
         self,
         task_id: str,
-        coro: Any,  # Coroutine
-        handle: Any,  # TaskHandle
-    ) -> asyncio.Task[Any]:
+        coro: Coroutine[Any, Any, None],
+        handle: TaskHandle,
+    ) -> asyncio.Task[None]:
         """Create and track a new background task.
 
         Args:
@@ -332,18 +336,22 @@ class TaskManager:
         Returns:
             The created asyncio.Task.
         """
-        task = asyncio.create_task(coro)
+        task = asyncio.create_task(coro, name=f"subagent-{task_id}")
         self.tasks[task_id] = task
         self.handles[task_id] = handle
         self._cancel_events[task_id] = asyncio.Event()
+        # `cleanup_task` drops `tasks[task_id]` from inside the task's own
+        # `finally`, and the event loop only holds a weak reference, so a second
+        # strong reference keeps the task alive until it is truly done.
+        self._strong_refs.add(task)
+        task.add_done_callback(self._strong_refs.discard)
 
-        # Update handle when task starts
         handle.status = TaskStatus.RUNNING
-        handle.started_at = datetime.now()
+        handle.started_at = utcnow()
 
         return task
 
-    def get_handle(self, task_id: str) -> Any | None:
+    def get_handle(self, task_id: str) -> TaskHandle | None:
         """Get the handle for a task.
 
         Args:
@@ -393,11 +401,30 @@ class TaskManager:
         """
         self._answer_futures.pop(task_id, None)
 
+    def resolve_answer(self, task_id: str, answer: str) -> bool:
+        """Deliver an answer to a task blocked in `ask_parent`.
+
+        Args:
+            task_id: The task ID.
+            answer: The answer to deliver.
+
+        Returns:
+            Whether a waiting `ask_parent` call was resolved.
+        """
+        future = self._answer_futures.get(task_id)
+        if future is not None and not future.done():
+            future.set_result(answer)
+            return True
+        return False
+
     async def soft_cancel(self, task_id: str) -> bool:
         """Request cooperative cancellation of a task.
 
-        Sets a cancellation event that the task can check periodically.
-        The task is expected to clean up and exit gracefully.
+        Sets a cancellation event that the run loop checks between graph nodes,
+        so the subagent stops at a clean boundary with its partial progress
+        intact. A task blocked in `ask_parent` sits inside a tool call rather
+        than at a node boundary, so its pending question is resolved too --
+        otherwise the cancel would only take effect after the ask timeout.
 
         Args:
             task_id: The task to cancel.
@@ -409,35 +436,36 @@ class TaskManager:
             return False
 
         self._cancel_events[task_id].set()
+        self.resolve_answer(
+            task_id,
+            "Your parent agent cancelled this task. Stop working and wrap up immediately.",
+        )
 
-        # Send cancel request message. Only relevant when a handle exists for
-        # the task (created through create_task); the receiver is keyed off the
-        # task_id, not the handle.
         if task_id in self.handles:
-            try:
+            with contextlib.suppress(KeyError):
+                # The running subagent registers on the bus as
+                # `subagent-{task_id}`, not under its subagent name.
                 await self.message_bus.send(
                     AgentMessage(
                         type=MessageType.CANCEL_REQUEST,
                         sender="task_manager",
-                        # The running subagent registers on the bus as
-                        # `subagent-{task_id}` (see toolset.py), not under its
-                        # subagent_name - sending to the latter raised a swallowed
-                        # KeyError so the cancel request never arrived.
                         receiver=f"subagent-{task_id}",
                         payload={"reason": "soft_cancel"},
                         task_id=task_id,
                     )
                 )
-            except KeyError:
-                pass  # Agent not registered, that's OK
 
         return True
 
     async def hard_cancel(self, task_id: str) -> bool:
         """Immediately cancel a task.
 
-        Calls cancel() on the asyncio.Task, causing CancelledError
-        to be raised in the task.
+        Calls `cancel()` on the `asyncio.Task`. The task's own
+        `except asyncio.CancelledError` branch records the terminal status; the
+        handle is only marked here for a bare task registered without that
+        wrapper. `TaskHandle.finish` makes the first terminal transition win, so
+        a cancel arriving while the task is already completing cannot overwrite
+        the real outcome.
 
         Args:
             task_id: The task to cancel.
@@ -451,30 +479,56 @@ class TaskManager:
         task = self.tasks[task_id]
         if not task.done():
             task.cancel()
-            # Only mark the handle cancelled when the task was actually still
-            # running. If it already finished, its run_task `finally` has set
-            # the real outcome (COMPLETED/FAILED and `completed_at`); we must
-            # not clobber that with a spurious `cancelled` and lose the real
-            # result. When a run_task wrapper is present its
-            # `except asyncio.CancelledError` branch will set the final status
-            # once the CancelledError is delivered; setting CANCELLED here keeps
-            # the handle consistent for the bare-task case and is idempotent.
-            if task_id in self.handles:
-                handle = self.handles[task_id]
-                handle.status = TaskStatus.CANCELLED
-                handle.completed_at = datetime.now()
+            handle = self.handles.get(task_id)
+            if handle is not None:
+                handle.finish(TaskStatus.CANCELLED, error="Task was cancelled")
 
         return True
 
+    async def cancel_all(self, parent_run_id: str | None = None) -> None:
+        """Cancel every live task and wait for it to finish cleaning up.
+
+        Called when a parent run ends. A background delegation that outlives its
+        parent keeps working against deps the application has already torn down,
+        and one blocked in `ask_parent` waits for an answer that can never come.
+
+        Args:
+            parent_run_id: Only cancel tasks started by this parent run. `None`
+                cancels every live task.
+        """
+        live: list[asyncio.Task[None]] = []
+        for task_id, task in list(self.tasks.items()):
+            handle = self.handles.get(task_id)
+            if parent_run_id is not None and (
+                handle is None or handle.parent_run_id != parent_run_id
+            ):
+                continue
+            if not task.done():
+                # `cancel()` raises into whatever the task is awaiting, including a
+                # future held by `ask_parent`, so there is nothing to unblock first.
+                task.cancel()
+                live.append(task)
+                # A task cancelled before its coroutine started never reaches its
+                # own `except asyncio.CancelledError`, so record the outcome here.
+                # `finish` is idempotent, so a task that does get there wins.
+                if handle is not None:
+                    handle.finish(TaskStatus.CANCELLED, error="Task was cancelled")
+
+        for task in live:
+            # We requested the cancel, so the task acknowledging it is success.
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     def cleanup_task(self, task_id: str) -> None:
         """Clean up resources for a completed task.
+
+        The handle is kept so status and telemetry stay queryable.
 
         Args:
             task_id: The task to clean up.
         """
         self.tasks.pop(task_id, None)
         self._cancel_events.pop(task_id, None)
-        # Keep handle for status queries
 
     def list_active_tasks(self) -> list[str]:
         """Get list of active (non-completed) task IDs.
@@ -484,7 +538,7 @@ class TaskManager:
         """
         return [task_id for task_id, task in self.tasks.items() if not task.done()]
 
-    def list_handles(self) -> list[Any]:
+    def list_handles(self) -> list[TaskHandle]:
         """Get all task handles (completed and active).
 
         Returns:

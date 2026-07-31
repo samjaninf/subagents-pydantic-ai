@@ -23,6 +23,18 @@ each model-request/tool node so the handler receives every event.
 When retrying is disabled (`max_retries == 0`) the legacy `agent.run()`
 call path is used unchanged (it already honours the handler), so behaviour
 only differs when retrying is opted in.
+
+## Coupling to pydantic-ai internals
+
+:func:`_drive_run` mirrors the driving loop inside :meth:`Agent.run`, which
+means it uses private names (`run._advance_graph`, `run._run_node_with_hooks`,
+`_agent_graph.build_run_context`, `run.ctx.deps.root_capability`). There is no
+public way to drive a run with a custom step while keeping event streaming, so
+the copy is deliberate — but it can drift. `tests/test_retry.py` asserts the
+observable contract the copy has to preserve (node hooks fire, the handler
+receives every event, the wrapped stream is fully drained), and
+`pyproject.toml` pins a `pydantic-ai-slim` lower bound for the names above.
+Removing the copy needs a public primitive in core, not a workaround here.
 """
 
 from __future__ import annotations
@@ -35,15 +47,16 @@ from typing import Any
 
 from pydantic_ai import _agent_graph
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
-from pydantic_ai.messages import UserPromptPart
 from pydantic_graph import End
 
 from subagents_pydantic_ai.types import SubAgentConfig
 
-# HTTP status codes that indicate a transient, retry-worthy failure:
-# request timeout, conflict, too-early, rate limit, and 5xx server/gateway
-# errors (502/503/504 are typical of an overloaded LiteLLM proxy).
-_TRANSIENT_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+# HTTP status codes worth retrying: request timeout, rate limit, and 5xx
+# server/gateway errors (502/503/504 are typical of an overloaded LiteLLM
+# proxy). 409 Conflict and 425 Too Early are deliberately absent — they signal
+# a request the server rejected on its merits, and replaying it unchanged is
+# not expected to succeed.
+_TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504, 529})
 
 RetryPredicate = Callable[[BaseException], bool]
 """Predicate deciding whether an exception is a transient, retryable error."""
@@ -57,9 +70,9 @@ def is_transient_error(exc: BaseException) -> bool:
 
     Treated as transient (worth retrying):
 
-    - `ModelHTTPError` with a 408/409/425/429/5xx status code — gateway
-      hiccups, rate limits or upstream overload, typical with proxies
-      such as LiteLLM.
+    - `ModelHTTPError` with a 408/429/5xx status code — gateway hiccups,
+      rate limits or upstream overload, typical with proxies such as
+      LiteLLM.
     - `ModelAPIError` that is *not* an HTTP error — connection resets,
       read timeouts and other transport-level problems surfaced by the
       model client.
@@ -185,12 +198,13 @@ async def _drive_run(
     caller's cancellation handling unchanged.
 
     `inject_messages` enables unprompted parent -> child steering: it is
-    awaited just before each model-request node and returns any pending
-    steering messages, which are appended as :class:`UserPromptPart`s to that
-    request. The subagent therefore sees them as extra user instructions on
-    its very next model turn, keeping all partial progress. Injecting only at
-    model-request boundaries (not before tool execution) guarantees the parts
-    are never spliced into a tool-call/tool-return pair.
+    awaited between nodes and its messages are handed to `AgentRun.enqueue`,
+    pydantic-ai's own primitive for injecting content into a live run. Core
+    delivers them before the next model request, so the subagent sees them as
+    extra user instructions while keeping all partial progress, and the parts
+    can never be spliced into a tool-call/tool-return pair. Splicing
+    `UserPromptPart`s into `node.request.parts` by hand did the same job before
+    `enqueue` existed and is no longer needed.
     """
 
     _stream_step: Any = None
@@ -205,9 +219,13 @@ async def _drive_run(
                     )
                     if event_stream_handler is not None:
                         await event_stream_handler(run_ctx, wrapped)
-                    else:
-                        async for _ in wrapped:
-                            pass
+                    # Drain whatever the handler left unconsumed so the node can
+                    # finish through any stream wrappers. Matches `Agent.run`,
+                    # which drains unconditionally; draining only in the
+                    # no-handler case left wrappers unfinished for a handler that
+                    # stops reading early.
+                    async for _ in wrapped:
+                        pass
             return await run._advance_graph(node)
 
         _stream_step = _stream_and_advance
@@ -221,16 +239,10 @@ async def _drive_run(
         # A capability's wrap_run short-circuit can publish the result early.
         if run.result is not None:
             break
-        # Fold pending parent -> child steering into the upcoming request. Only
-        # at a model-request boundary, so a UserPromptPart is never spliced
-        # between a tool call and its return.
-        if inject_messages is not None and isinstance(node, _agent_graph.ModelRequestNode):
+        if inject_messages is not None:
             steering = await inject_messages()
             if steering:
-                node.request.parts = [
-                    *node.request.parts,
-                    *(UserPromptPart(content=text) for text in steering),
-                ]
+                run.enqueue(*steering, priority="asap")
         if _stream_step is not None:
             node = await run._run_node_with_hooks(node, _stream_step)
         else:

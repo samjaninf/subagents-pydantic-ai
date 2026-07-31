@@ -114,6 +114,11 @@ markdown_extensions:
   - pymdownx.mark
   - pymdownx.smartsymbols
   - pymdownx.snippets:
+      # The repo root is on the path so `docs/changelog.md` can include the
+      # top-level CHANGELOG.md instead of duplicating it.
+      base_path:
+        - .
+        - docs
       auto_append:
         - includes/abbreviations.md
   - pymdownx.superfences:
@@ -153,12 +158,17 @@ nav:
     - Capability: concepts/capability.md
     - Subagents: concepts/subagents.md
     - Toolset: concepts/toolset.md
+    - Observability: concepts/observability.md
     - Types: concepts/types.md
   - Advanced Features:
     - advanced/execution-modes.md
     - advanced/questions.md
+    - advanced/steering.md
+    - advanced/chat-traces.md
     - advanced/cancellation.md
+    - advanced/errors.md
     - advanced/retries.md
+    - advanced/usage-limits.md
     - advanced/dynamic-agents.md
     - advanced/message-bus.md
   - Examples:
@@ -177,8 +187,14 @@ nav:
     - Capability: api/capability.md
     - Toolset: api/toolset.md
     - Types: api/types.md
-    - Prompts & Retry: api/prompts.md
     - Protocols: api/protocols.md
+    - Registry: api/registry.md
+    - Dynamic Agents: api/dynamic-agent.md
+    - Message Bus: api/message-bus.md
+    - Retry: api/retry.md
+    - Spec: api/spec.md
+    - Prompts: api/prompts.md
+  - Changelog: changelog.md
 
 validation:
   nav:

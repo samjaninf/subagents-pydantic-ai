@@ -55,7 +55,7 @@ jobs:
         run: uv run pyright
 
       - name: Run MyPy
-        run: uv run mypy src/subagents_pydantic_ai
+        run: uv run mypy src/subagents_pydantic_ai tests
 
   test:
     name: Test Python ${{ matrix.python-version }}

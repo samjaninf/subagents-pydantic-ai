@@ -1,0 +1,394 @@
+"""Running one delegated task, synchronously or in the background.
+
+## Error contract
+
+A delegation can fail in four distinct ways, and collapsing them into one string
+result -- which is what this module used to do -- loses information the parent run
+needs:
+
+- **Control-flow signals** (`CallDeferred`, `ApprovalRequired`, `Skip*`) are how
+  pydantic-ai suspends a run for deferred tools or human approval. Catching them
+  turns a suspended run into a tool result the parent reads as a finished task, so
+  they always propagate.
+- **`UserError`** is a setup mistake no retry can fix. Reporting it to the model as
+  a task failure hides it, so it always propagates.
+- **`UsageLimitExceeded`** on a budget shared with the parent means the whole agent
+  tree is out of budget, so it propagates too.
+- **Everything else** is a failure the parent can react to. It reaches the parent as
+  `ModelRetry`, which engages pydantic-ai's retry budget, rather than as a normal
+  tool result whose text happens to start with `Error`.
+
+Background delegations are always soft: the parent already received its tool result
+(the task id), so an outcome can only be delivered as a status transition.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Callable
+from typing import Any
+
+from pydantic_ai import UsageLimits
+from pydantic_ai.exceptions import (
+    ApprovalRequired,
+    CallDeferred,
+    ModelRetry,
+    SkipModelRequest,
+    SkipToolExecution,
+    SkipToolValidation,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+    UserError,
+)
+
+from subagents_pydantic_ai._observability import (
+    capture_message_history,
+    capture_observability,
+    serialize_output,
+)
+from subagents_pydantic_ai._state import SubAgentState, bind_subagent_state
+from subagents_pydantic_ai.message_bus import InMemoryMessageBus, TaskManager
+from subagents_pydantic_ai.prompts import get_task_instructions_prompt
+from subagents_pydantic_ai.retry import RetryConfig, run_with_retry
+from subagents_pydantic_ai.types import (
+    AskUserCallback,
+    MessageType,
+    SubAgentConfig,
+    TaskHandle,
+    TaskPriority,
+    TaskStatus,
+    utcnow,
+)
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_ASK_TIMEOUT_SECONDS = 300.0
+"""How long `ask_parent` waits for the parent before proceeding on its own."""
+
+_ALWAYS_PROPAGATE: tuple[type[Exception], ...] = (
+    CallDeferred,
+    ApprovalRequired,
+    SkipModelRequest,
+    SkipToolValidation,
+    SkipToolExecution,
+    UserError,
+)
+"""Signals that must reach the parent run even when errors are contained.
+
+Containing the first five breaks the agent graph -- they are deferred/approval
+control flow, not failures. `UserError` is a configuration bug that no retry fixes.
+"""
+
+_HUMAN_IN_THE_LOOP: tuple[type[Exception], ...] = (CallDeferred, ApprovalRequired)
+"""Signals a background delegation cannot deliver: they need a caller to hand the
+deferred state back to, and the delegating tool returned long ago."""
+
+
+def _build_run_kwargs(
+    deps: Any,
+    *,
+    extra_toolsets: list[Any] | None,
+    usage_limits: UsageLimits | None,
+    message_history: list[Any] | None,
+    conversation_id: str | None,
+) -> dict[str, Any]:
+    run_kwargs: dict[str, Any] = {"deps": deps}
+    if extra_toolsets:
+        run_kwargs["toolsets"] = extra_toolsets
+    if usage_limits is not None:
+        run_kwargs["usage_limits"] = usage_limits
+    if message_history is not None:
+        run_kwargs["message_history"] = message_history
+    if conversation_id is not None:
+        run_kwargs["conversation_id"] = conversation_id
+    return run_kwargs
+
+
+def _task_prompt(config: SubAgentConfig, description: str) -> str:
+    return get_task_instructions_prompt(
+        description,
+        can_ask_questions=config.get("can_ask_questions", True),
+        max_questions=config.get("max_questions"),
+    )
+
+
+async def _run_sync(
+    agent: Any,
+    config: SubAgentConfig,
+    description: str,
+    deps: Any,
+    task_id: str,
+    extra_toolsets: list[Any] | None = None,
+    ask_user: AskUserCallback | None = None,
+    usage_limits: UsageLimits | None = None,
+    handle: TaskHandle | None = None,
+    message_history: list[Any] | None = None,
+    on_message_history: Callable[[list[Any]], None] | None = None,
+    ask_timeout_seconds: float = DEFAULT_ASK_TIMEOUT_SECONDS,
+    contain_errors: bool = True,
+) -> str:
+    """Run a subagent task synchronously, blocking until it finishes.
+
+    Args:
+        agent: The agent to run.
+        config: Subagent configuration.
+        description: Task description.
+        deps: Dependencies for the subagent.
+        task_id: Unique task identifier.
+        extra_toolsets: Additional toolsets for this run.
+        ask_user: Callback backing `ask_parent`. Required for questions in sync
+            mode: the parent's run loop is blocked here, so it cannot answer
+            through `answer_subagent`.
+        usage_limits: Usage limits forwarded to the run, honoured on every retry.
+        handle: Task handle populated for observability.
+        message_history: Prior history when continuing a chat trace.
+        on_message_history: Receives the successful run's full message history.
+        ask_timeout_seconds: How long `ask_parent` waits for `ask_user`.
+        contain_errors: Whether a subagent crash is converted into a `ModelRetry`
+            for the parent instead of propagating and aborting the parent run.
+            Signals in `_ALWAYS_PROPAGATE` ignore this.
+
+    Returns:
+        The subagent's output, or the configured `on_failure` message.
+
+    Raises:
+        ModelRetry: When the subagent failed and no `on_failure` message is set.
+        Exception: Control-flow signals, `UserError`, a shared `UsageLimitExceeded`,
+            and -- when `contain_errors` is false -- any other subagent exception.
+    """
+    prompt = _task_prompt(config, description)
+    run_kwargs = _build_run_kwargs(
+        deps,
+        extra_toolsets=extra_toolsets,
+        usage_limits=usage_limits,
+        message_history=message_history,
+        conversation_id=handle.chat_trace_id if handle is not None else None,
+    )
+    state = SubAgentState(ask_timeout_seconds=ask_timeout_seconds, ask_callback=ask_user)
+
+    try:
+        with bind_subagent_state(state):
+            result = await run_with_retry(
+                agent,
+                prompt,
+                run_kwargs=run_kwargs,
+                retry=RetryConfig.from_config(config),
+            )
+    except _ALWAYS_PROPAGATE:
+        _fail(handle, "propagated")
+        raise
+    except UsageLimitExceeded:
+        _fail(handle, "usage limit exceeded")
+        raise
+    except (ModelRetry, UnexpectedModelBehavior) as exc:
+        return _degrade(handle, config, task_id, exc, crashed=False)
+    except Exception as exc:
+        if not contain_errors:
+            _fail(handle, str(exc))
+            raise
+        return _degrade(handle, config, task_id, exc, crashed=True)
+
+    capture_message_history(result, on_message_history)
+    output = serialize_output(result.output)
+    if handle is not None:
+        handle.finish(TaskStatus.COMPLETED, result=output)
+        # Telemetry runs after the run is marked complete, so a capture failure
+        # can never flip a successful run to FAILED.
+        capture_observability(handle, result)
+    return output
+
+
+def _fail(handle: TaskHandle | None, error: str) -> None:
+    if handle is not None:
+        handle.finish(TaskStatus.FAILED, error=error)
+
+
+def _degrade(
+    handle: TaskHandle | None,
+    config: SubAgentConfig,
+    task_id: str,
+    exc: BaseException,
+    *,
+    crashed: bool,
+) -> str:
+    """Record a failed delegation and tell the parent about it.
+
+    Raises `ModelRetry` unless the subagent configured an `on_failure` message, in
+    which case the parent receives that as an ordinary tool result.
+    """
+    name = config["name"]
+    _fail(handle, f"{type(exc).__name__}: {exc}")
+    if crashed:
+        # Contained, but loud: the exception rides the retry message and is logged,
+        # and the tool's retry budget still turns repeated crashes into an abort.
+        logger.warning("Contained crash from subagent %r (task %s)", name, task_id, exc_info=exc)
+    on_failure = config.get("on_failure")
+    if on_failure is not None:
+        return on_failure
+    verb = "crashed" if crashed else "failed"
+    raise ModelRetry(
+        f"Subagent {name!r} {verb}: {type(exc).__name__}: {exc}. "
+        f"Treat this as a recoverable failure and decide from the evidence you have."
+    ) from exc
+
+
+async def _run_async(
+    agent: Any,
+    config: SubAgentConfig,
+    description: str,
+    deps: Any,
+    task_id: str,
+    task_manager: TaskManager,
+    message_bus: InMemoryMessageBus,
+    priority: TaskPriority = TaskPriority.NORMAL,
+    extra_toolsets: list[Any] | None = None,
+    usage_limits: UsageLimits | None = None,
+    chat_trace_id: str | None = None,
+    message_history: list[Any] | None = None,
+    on_message_history: Callable[[list[Any]], None] | None = None,
+    on_run_finished: Callable[[], None] | None = None,
+    ask_timeout_seconds: float = DEFAULT_ASK_TIMEOUT_SECONDS,
+    parent_run_id: str | None = None,
+) -> str:
+    """Start a subagent task in the background and return its handle text.
+
+    Args:
+        agent: The agent to run.
+        config: Subagent configuration.
+        description: Task description.
+        deps: Dependencies for the subagent.
+        task_id: Unique task identifier.
+        task_manager: Owns the task, its handle, and its cancellation state.
+        message_bus: Delivers steering messages to the running subagent.
+        priority: Task priority recorded on the handle.
+        extra_toolsets: Additional toolsets for this run.
+        usage_limits: Usage limits forwarded to the run, honoured on every retry.
+        chat_trace_id: Chat trace this conversation belongs to, when continuable.
+        message_history: Prior history when continuing a chat trace.
+        on_message_history: Receives the successful run's full message history.
+        on_run_finished: Invoked once when the run finishes, however it finishes.
+        ask_timeout_seconds: How long `ask_parent` waits for the parent's answer.
+        parent_run_id: `run_id` of the parent run, so the task can be scoped to it.
+
+    Returns:
+        Text telling the parent the task id and how to check on it.
+    """
+    handle = TaskHandle(
+        task_id=task_id,
+        subagent_name=config["name"],
+        description=description,
+        status=TaskStatus.PENDING,
+        priority=priority,
+        chat_trace_id=chat_trace_id,
+        parent_run_id=parent_run_id,
+    )
+
+    agent_id = f"subagent-{task_id}"
+    try:
+        message_bus.register_agent(agent_id)
+    except ValueError:
+        pass  # Already registered
+
+    prompt = _task_prompt(config, description)
+    run_kwargs = _build_run_kwargs(
+        deps,
+        extra_toolsets=extra_toolsets,
+        usage_limits=usage_limits,
+        message_history=message_history,
+        conversation_id=chat_trace_id,
+    )
+    state = SubAgentState(
+        ask_timeout_seconds=ask_timeout_seconds,
+        task_manager=task_manager,
+        task_id=task_id,
+    )
+
+    async def run_task() -> None:
+        def on_retry(attempt: int, exc: BaseException, delay: float) -> None:
+            handle.status = TaskStatus.RETRYING
+            handle.retry_count = attempt
+            handle.error = f"Transient error (retry {attempt}): {exc}"
+
+        def cancel_requested() -> bool:
+            # Cooperative cancellation: `soft_cancel` sets this event and the run
+            # loop polls it between graph nodes, so the subagent stops at a clean
+            # boundary with its partial progress intact.
+            cancel_event = task_manager.get_cancel_event(task_id)
+            return cancel_event is not None and cancel_event.is_set()
+
+        async def pending_steering() -> list[str]:
+            return await drain_steering_messages(message_bus, agent_id)
+
+        try:
+            with bind_subagent_state(state):
+                result = await run_with_retry(
+                    agent,
+                    prompt,
+                    run_kwargs=run_kwargs,
+                    retry=RetryConfig.from_config(config),
+                    on_retry=on_retry,
+                    cancel_check=cancel_requested,
+                    inject_messages=pending_steering,
+                )
+            capture_message_history(result, on_message_history)
+            if handle.finish(TaskStatus.COMPLETED, result=serialize_output(result.output)):
+                capture_observability(handle, result)
+        except asyncio.CancelledError:
+            handle.finish(TaskStatus.CANCELLED, error="Task was cancelled")
+            raise
+        except _HUMAN_IN_THE_LOOP as exc:
+            handle.finish(
+                TaskStatus.FAILED,
+                error=(
+                    f"{type(exc).__name__}: a subagent that needs approval or defers a "
+                    f"tool call cannot run in the background; delegate it with mode='sync'."
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Background subagent %r failed (task %s)", config["name"], task_id, exc_info=exc
+            )
+            handle.finish(TaskStatus.FAILED, error=f"{type(exc).__name__}: {exc}")
+        finally:
+            if handle.completed_at is None:  # pragma: no cover - every path finishes above
+                handle.completed_at = utcnow()
+            message_bus.unregister_agent(agent_id)
+            task_manager.clear_answer_future(task_id)
+            task_manager.cleanup_task(task_id)
+            if on_run_finished is not None:
+                on_run_finished()
+
+    task_manager.create_task(task_id, run_task(), handle)
+
+    response = f"Task started in background.\nTask ID: {task_id}\nSubagent: {config['name']}\n"
+    if chat_trace_id is not None:
+        response += f"Chat Trace ID: {chat_trace_id}\n"
+    response += f"Use check_task('{task_id}') to check status."
+    return response
+
+
+async def drain_steering_messages(message_bus: InMemoryMessageBus, agent_id: str) -> list[str]:
+    """Take the parent-to-child steering messages queued for a running subagent.
+
+    Only `TASK_UPDATE` carries steering. Other message types on the queue (an
+    unused `CANCEL_REQUEST` -- soft cancel runs off the cancel event, not the bus)
+    and empty payloads are ignored.
+
+    Args:
+        message_bus: The bus the running subagent is registered on.
+        agent_id: The subagent's bus id (`subagent-{task_id}`).
+
+    Returns:
+        Steering instructions in delivery order, possibly empty.
+    """
+    pending = await message_bus.get_messages(agent_id, timeout=0)
+    steering: list[str] = []
+    for msg in pending:
+        if msg.type != MessageType.TASK_UPDATE:
+            continue
+        payload = msg.payload
+        text = payload.get("message") if isinstance(payload, dict) else payload
+        if text:
+            steering.append(str(text))
+    return steering

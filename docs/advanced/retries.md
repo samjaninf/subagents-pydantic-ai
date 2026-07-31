@@ -120,7 +120,7 @@ a plain `agent.run()` &mdash; the legacy path, unchanged. Event streaming
 across retries, and cooperative (soft) cancellation is honoured at node boundaries
 on the retry-driven path.
 
-See the [Prompts &amp; Retry API](../api/prompts.md#retry) for full signatures.
+See the [Prompts &amp; Retry API](../api/retry.md) for full signatures.
 
 ## Next Steps
 

@@ -13,16 +13,32 @@ The main entry point for creating subagent delegation capabilities.
 - [`SubAgentToolset`](toolset.md#subagenttoolset) - The toolset class
 - [`get_subagent_system_prompt()`](prompts.md#get_subagent_system_prompt) - Generate system prompt
 
-### Prompts &amp; Retry
+### Prompts
 
-Prompt builders, default tool descriptions, and auto-retry helpers.
+Prompt builders and the default model-facing tool descriptions.
 
 - [`get_subagent_system_prompt()`](prompts.md#get_subagent_system_prompt) - Generate system prompt
 - [`get_task_instructions_prompt()`](prompts.md#get_task_instructions_prompt) - Generate task instructions
-- [`RetryConfig`](prompts.md#retryconfig) - Resolved retry policy
-- [`run_with_retry()`](prompts.md#run_with_retry) - Retry driver
-- [`is_transient_error()`](prompts.md#is_transient_error) - Transient-error classifier
-- [`compute_backoff_delay()`](prompts.md#compute_backoff_delay) - Backoff computation
+
+### Retry
+
+Auto-retry for transient model and gateway failures.
+
+- [`RetryConfig`](retry.md#retryconfig) - Resolved retry policy
+- [`run_with_retry()`](retry.md#run_with_retry) - Retry driver
+- [`is_transient_error()`](retry.md#is_transient_error) - Transient-error classifier
+- [`compute_backoff_delay()`](retry.md#compute_backoff_delay) - Backoff computation
+
+### Spec
+
+- [`SubAgentSpec`](spec.md#subagentspec) - Validated YAML/JSON subagent definition
+
+### Dynamic agents
+
+Building specialists at runtime.
+
+- [`AgentFactory`](dynamic-agent.md#agentfactory) - Custom agent builder
+- [`build_dynamic_agent()`](dynamic-agent.md#build_dynamic_agent) - Validate and build
 
 ### Types
 
@@ -30,7 +46,7 @@ Data structures used throughout the library.
 
 - [`SubAgentConfig`](types.md#subagentconfig) - Subagent configuration
 - [`CompiledSubAgent`](types.md#compiledsubagent) - Pre-compiled subagent
-- [`TaskHandle`](types.md#taskhandle) - Background task handle
+- [`TaskHandle`](types.md#taskhandle) - Background task handle and its telemetry
 - [`TaskStatus`](types.md#taskstatus) - Task status enum
 - [`TaskPriority`](types.md#taskpriority) - Task priority enum
 - [`ExecutionMode`](types.md#executionmode) - Execution mode type
@@ -50,15 +66,15 @@ Interface definitions for extensibility.
 
 Communication layer components.
 
-- [`InMemoryMessageBus`](protocols.md#inmemorymessagebus) - Default message bus
-- [`TaskManager`](protocols.md#taskmanager) - Task coordination
-- [`create_message_bus()`](protocols.md#create_message_bus) - Factory function
+- [`InMemoryMessageBus`](message-bus.md#inmemorymessagebus) - Default message bus
+- [`TaskManager`](message-bus.md#taskmanager) - Task coordination
+- [`create_message_bus()`](message-bus.md#create_message_bus) - Factory function
 
 ### Registry
 
 Dynamic agent management.
 
-- [`DynamicAgentRegistry`](protocols.md#dynamicagentregistry) - Agent registry
+- [`DynamicAgentRegistry`](registry.md#dynamicagentregistry) - Agent registry
 
 ## Quick Reference
 

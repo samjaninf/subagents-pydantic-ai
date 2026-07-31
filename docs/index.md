@@ -30,13 +30,13 @@ Think of it as the building blocks for multi-agent systems - where a parent agen
 
 ## Why use Subagents?
 
-1. **Specialization**: Each subagent has focused instructions and tools for its domain. A "researcher" agent researches, a "writer" agent writes.
+1. **Specialization**: each subagent has focused instructions and tools for its domain. A "researcher" agent researches, a "writer" agent writes, and neither carries the other's context.
 
-2. **Parallel Execution**: Run multiple tasks simultaneously in async mode. Start a research task, continue with other work, check results later.
+2. **Parallel execution**: run several tasks in the background, keep working, and collect results with `wait_tasks` — reacting to the first finisher instead of stalling on the slowest.
 
-3. **Nested Hierarchies**: Subagents can spawn their own subagents. Build complex multi-agent workflows with natural delegation patterns.
+3. **Course correction**: [steer a running subagent](advanced/steering.md) when you learn something new, keeping its partial progress, and [answer its questions](advanced/questions.md) when it needs clarification.
 
-4. **Smart Mode Selection**: Auto-mode intelligently chooses sync vs async based on task complexity and requirements.
+4. **Accountability**: every delegation records its [cost, tokens, tool calls, and traceparent](concepts/observability.md), so a fan-out is not a black box.
 
 ## Quick Start (Capability API)
 
@@ -81,28 +81,35 @@ agent = Agent("openai:gpt-4.1", toolsets=[toolset])
     With the toolset API you need to wire `get_subagent_system_prompt()` into the
     agent's instructions manually. `SubAgentCapability` handles this automatically.
 
-## Core Features
+## Core features
 
 | Feature | Description |
 |---------|-------------|
-| **Dual-Mode Execution** | Run tasks sync (blocking) or async (background) |
-| **Auto-Mode Selection** | Intelligent mode selection based on task characteristics |
-| **Nested Subagents** | Subagents can spawn their own subagents |
-| **Runtime Agent Creation** | Create specialized agents on-the-fly |
-| **Parent-Child Q&A** | Subagents can ask parent for clarification |
-| **Task Cancellation** | Soft and hard cancellation support |
-| **Pluggable Message Bus** | Extensible communication layer |
+| [**Dual-mode execution**](advanced/execution-modes.md) | Run a task blocking or in the background, or let `mode="auto"` decide |
+| [**Chat traces**](advanced/chat-traces.md) | Continue a subagent's conversation across delegations |
+| [**Questions**](advanced/questions.md) | A subagent asks its parent for clarification mid-task |
+| [**Steering**](advanced/steering.md) | Redirect a running task without losing its progress |
+| [**Cancellation**](advanced/cancellation.md) | Cooperative (clean boundary) or immediate |
+| [**Retries**](advanced/retries.md) | Transient gateway failures resume from accumulated history |
+| [**Usage limits**](advanced/usage-limits.md) | One shared budget, or a fresh budget per task |
+| [**Observability**](concepts/observability.md) | Per-task cost, tokens, tool-call counts, traceparent |
+| [**Dynamic agents**](advanced/dynamic-agents.md) | Create specialists at runtime, reusable or one-shot |
 
-## Available Tools
+## Available tools
 
-When you add the subagent toolset, your agent gets these tools:
+Your agent gets these tools. `create_agent` and `delegate` are opt-in — see
+[delegation configuration](concepts/toolset.md).
 
 | Tool | Description |
 |------|-------------|
-| `task` | Delegate a task to a subagent (sync, async, or auto) |
-| `check_task` | Check status and get result of a background task |
+| `task` | Delegate a task to a configured or registry-backed subagent |
+| `create_agent` | Create a reusable specialist at runtime (opt-in) |
+| `delegate` | Create an ephemeral specialist and run a task in one call (opt-in) |
+| `check_task` | Check status and get the full result of a background task |
+| `wait_tasks` | Wait for background tasks, in `all` or `any` mode |
+| `list_active_tasks` | List the running background tasks of this run |
 | `answer_subagent` | Answer a question from a blocked subagent |
-| `list_active_tasks` | List all running background tasks |
+| `send_message_to_subagent` | Steer a running background subagent |
 | `soft_cancel_task` | Request cooperative cancellation |
 | `hard_cancel_task` | Immediately cancel a task |
 
@@ -123,12 +130,14 @@ Subagents for Pydantic AI is part of a modular ecosystem:
 pip install subagents-pydantic-ai
 ```
 
-## Next Steps
+## Next steps
 
-- [Installation](installation.md) - Get started in minutes
-- [Core Concepts](concepts/index.md) - Learn about subagents, toolsets, and types
-- [Examples](examples/index.md) - See subagents in action
-- [API Reference](api/index.md) - Complete API documentation
+- [Installation](installation.md) — get started in minutes
+- [Core concepts](concepts/index.md) — subagents, toolsets, observability, types
+- [Execution modes](advanced/execution-modes.md) — when to block and when not to
+- [Failure handling](advanced/errors.md) — what propagates and what is contained
+- [Examples](examples/index.md) — see subagents in action
+- [API reference](api/index.md) — the generated reference
 
 ---
 

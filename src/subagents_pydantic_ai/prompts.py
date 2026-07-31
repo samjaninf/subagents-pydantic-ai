@@ -206,13 +206,17 @@ Use only when soft cancellation doesn't work or immediate stopping is required."
 
 def get_subagent_system_prompt(
     configs: list[SubAgentConfig],
-    include_dual_mode: bool = True,
+    include_dual_mode: bool = False,
 ) -> str:
-    """Generate system prompt section describing available subagents.
+    """Generate the system prompt section describing available subagents.
 
     Args:
-        configs: List of subagent configurations.
-        include_dual_mode: Whether to include dual-mode execution explanation.
+        configs: Subagent configurations to list.
+        include_dual_mode: Append `DUAL_MODE_SYSTEM_PROMPT`, explaining sync
+            versus background execution. Off by default because
+            `TASK_TOOL_DESCRIPTION` already covers execution modes where the
+            model needs them, and repeating it in the system prompt is wasted
+            context. The parameter used to be accepted and ignored.
 
     Returns:
         Formatted system prompt section.
@@ -229,18 +233,21 @@ def get_subagent_system_prompt(
         prompt = get_subagent_system_prompt(configs)
         ```
     """
-    lines = ["## Available Subagents", ""]
-    lines.append("Use the `task` tool to delegate work to these subagents:")
-    lines.append("")
+    lines = [
+        "## Available Subagents",
+        "",
+        "Use the `task` tool to delegate work to these subagents:",
+        "",
+    ]
 
     for config in configs:
-        name = config["name"]
-        description = config["description"]
-        lines.append(f"- **{name}**: {description}")
-
-        # Add hint if agent cannot ask questions
+        line = f"- **{config['name']}**: {config['description']}"
         if config.get("can_ask_questions") is False:
-            lines[-1] += " *(cannot ask clarifying questions)*"
+            line += " *(cannot ask clarifying questions)*"
+        lines.append(line)
+
+    if include_dual_mode:
+        lines.extend(["", DUAL_MODE_SYSTEM_PROMPT])
 
     return "\n".join(lines)
 

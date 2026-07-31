@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from agent_result_fakes import MockResult, MockResultWithMessages, MockUsage
 from pydantic import BaseModel
 from pydantic_ai import UsageLimits
+from pydantic_ai.exceptions import ApprovalRequired, CallDeferred, ModelRetry, UserError
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.toolsets import FunctionToolset
 from pydantic_graph import End
 
 from subagents_pydantic_ai import DynamicAgentRegistry, SubAgentConfig, create_subagent_toolset
+from subagents_pydantic_ai._state import SubAgentState, current_subagent_state
 from subagents_pydantic_ai.toolset import (
     _capture_result_observability,
     _create_ask_parent_toolset,
@@ -26,17 +28,44 @@ from subagents_pydantic_ai.toolset import (
     _run_async,
     _run_sync,
 )
-from subagents_pydantic_ai.types import CompiledSubAgent, TaskHandle, TaskPriority, TaskStatus
+from subagents_pydantic_ai.types import (
+    CompiledSubAgent,
+    TaskHandle,
+    TaskPriority,
+    TaskStatus,
+    utcnow,
+)
+from tests.agent_result_fakes import MockResult, MockResultWithMessages, MockUsage
 
 
 @dataclass
 class MockDeps:
-    """Mock dependencies for testing."""
+    """Mock dependencies for testing.
+
+    `_subagent_state` is declared so tests can exercise the legacy path where a
+    caller injects the state onto its own deps object. The library itself binds a
+    context variable instead.
+    """
 
     subagents: dict[str, Any] = field(default_factory=dict)
+    _subagent_state: dict[str, Any] | None = None
+    ask_user: Callable[[str, list[str]], Awaitable[str]] | None = None
 
     def clone_for_subagent(self, max_depth: int = 0) -> MockDeps:
         return MockDeps(subagents={} if max_depth <= 0 else self.subagents.copy())
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenDeps:
+    """Deps a caller may legitimately declare immutable.
+
+    The protocol permits it, so the library must not try to write state onto it.
+    """
+
+    subagents: dict[str, Any] = field(default_factory=dict)
+
+    def clone_for_subagent(self, max_depth: int = 0) -> FrozenDeps:
+        return FrozenDeps(subagents={} if max_depth <= 0 else dict(self.subagents))
 
 
 @dataclass
@@ -45,6 +74,7 @@ class MockRunContext:
 
     deps: MockDeps
     _subagent_state: dict[str, Any] | None = None
+    run_id: str | None = None
 
 
 class MockModelResponse:
@@ -104,6 +134,8 @@ class _FakeAgentCM:
         agent = self._agent
         if agent._delay:
             await asyncio.sleep(agent._delay)
+        if agent.on_enter is not None:
+            agent.on_enter()
         if agent._error is not None:
             raise agent._error
         return _FakeRun(agent._result, agent._messages)
@@ -136,6 +168,8 @@ class FakeAgent:
         self._delay = delay
         self._messages = messages or []
         self.iter_calls: list[dict[str, Any]] = []
+        self.on_enter: Callable[[], None] | None = None
+        """Called inside the run, for assertions about state visible to the child."""
 
     def iter(
         self, prompt: Any = None, *, message_history: Any = None, **kwargs: Any
@@ -402,7 +436,7 @@ class TestCreateAskParentToolset:
             return f"User answered: {question}"
 
         deps = MockDeps()
-        deps.ask_user = mock_ask_user  # type: ignore[attr-defined]
+        deps.ask_user = mock_ask_user
         ctx = MockRunContext(deps=deps)
 
         result = await ask_parent_tool.function(ctx, "what color?")
@@ -874,8 +908,12 @@ class TestRunSync:
         assert captured == [new_history]
 
     @pytest.mark.asyncio
-    async def test_run_sync_error(self):
-        """Test sync execution with error."""
+    async def test_run_sync_crash_raises_model_retry(self):
+        """A contained crash reaches the parent as ModelRetry, not a success string.
+
+        Returning `"Error executing task: ..."` presented a failure to the parent
+        model as a completed tool call, so pydantic-ai's retry budget never engaged.
+        """
         mock_agent = FakeAgent(error=Exception("Something went wrong"))
 
         config = SubAgentConfig(
@@ -884,26 +922,103 @@ class TestRunSync:
             instructions="Do test",
         )
 
+        with pytest.raises(ModelRetry) as exc_info:
+            await _run_sync(
+                agent=mock_agent,
+                config=config,
+                description="do the thing",
+                deps=MockDeps(),
+                task_id="task-123",
+            )
+
+        assert "Something went wrong" in str(exc_info.value)
+        assert "'test'" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_run_sync_crash_returns_on_failure_message(self):
+        """`on_failure` turns a crash into a steering message instead of a retry."""
+        mock_agent = FakeAgent(error=Exception("boom"))
+        config = SubAgentConfig(
+            name="test",
+            description="Test agent",
+            instructions="Do test",
+            on_failure="Summarise from what you already have.",
+        )
+        handle = TaskHandle(task_id="task-123", subagent_name="test", description="d")
+
         result = await _run_sync(
             agent=mock_agent,
             config=config,
             description="do the thing",
             deps=MockDeps(),
             task_id="task-123",
+            handle=handle,
         )
 
-        assert "Error" in result
-        assert "Something went wrong" in result
+        assert result == "Summarise from what you already have."
+        assert handle.status == TaskStatus.FAILED
+        assert handle.error == "Exception: boom"
 
     @pytest.mark.asyncio
-    async def test_run_sync_injects_ask_user_into_state(self):
-        """ask_user wires into _subagent_state so ask_parent can resolve it."""
+    async def test_run_sync_propagates_crash_when_not_contained(self):
+        """`contain_errors=False` lets the original exception reach the parent run."""
+        mock_agent = FakeAgent(error=ValueError("bad tool argument"))
+        config = SubAgentConfig(
+            name="test",
+            description="Test agent",
+            instructions="Do test",
+        )
+
+        with pytest.raises(ValueError, match="bad tool argument"):
+            await _run_sync(
+                agent=mock_agent,
+                config=config,
+                description="do the thing",
+                deps=MockDeps(),
+                task_id="task-123",
+                contain_errors=False,
+            )
+
+    @pytest.mark.asyncio
+    async def test_run_sync_propagates_control_flow_signals(self):
+        """Deferred/approval signals must reach the parent run, contained or not.
+
+        Swallowing them turns a suspended run into a tool result the parent reads
+        as a finished task, which breaks deferred tools and approval flows.
+        """
+        for signal in (CallDeferred(), ApprovalRequired(), UserError("misconfigured")):
+            mock_agent = FakeAgent(error=signal)
+            config = SubAgentConfig(
+                name="test",
+                description="Test agent",
+                instructions="Do test",
+            )
+
+            with pytest.raises(type(signal)):
+                await _run_sync(
+                    agent=mock_agent,
+                    config=config,
+                    description="do the thing",
+                    deps=MockDeps(),
+                    task_id="task-123",
+                    contain_errors=True,
+                )
+
+    @pytest.mark.asyncio
+    async def test_run_sync_binds_ask_user_without_touching_deps(self):
+        """`ask_user` reaches `ask_parent` through the context, not the deps object.
+
+        Writing `deps._subagent_state` raised `AttributeError` for a deps class
+        declared `frozen=True` or `slots=True`, both of which the protocol allows.
+        """
         mock_agent = FakeAgent(result=MockResult("done"))
+        captured: list[SubAgentState | None] = []
 
         async def ask_user(question: str) -> str:
             return f"answer: {question}"
 
-        deps = MockDeps()
+        mock_agent.on_enter = lambda: captured.append(current_subagent_state())
+        deps = FrozenDeps()
         config = SubAgentConfig(
             name="test",
             description="Test agent",
@@ -920,14 +1035,15 @@ class TestRunSync:
             ask_user=ask_user,
         )
 
-        captured_deps = mock_agent.iter_calls[0]["deps"]
-        assert captured_deps._subagent_state["ask_callback"] is ask_user
+        assert captured == [
+            SubAgentState(ask_timeout_seconds=300.0, ask_callback=ask_user),
+        ]
+        assert not hasattr(deps, "_subagent_state")
 
     @pytest.mark.asyncio
-    async def test_run_sync_no_ask_user_does_not_touch_deps(self):
-        """Without ask_user, _run_sync must not mutate deps state."""
+    async def test_run_sync_state_does_not_leak_past_the_delegation(self):
+        """The bound state is reset when the delegation returns."""
         mock_agent = FakeAgent(result=MockResult("done"))
-        deps = MockDeps()
         config = SubAgentConfig(
             name="test",
             description="Test agent",
@@ -938,11 +1054,11 @@ class TestRunSync:
             agent=mock_agent,
             config=config,
             description="do the thing",
-            deps=deps,
+            deps=MockDeps(),
             task_id="task-123",
         )
 
-        assert not hasattr(deps, "_subagent_state")
+        assert current_subagent_state() is None
 
 
 class TestResultObservability:
@@ -1275,7 +1391,7 @@ class TestToolsetIntegration:
 
             assert result.startswith("Sync result\n\nChat Trace ID: ")
             handle = mock_run_sync.call_args.kwargs["handle"]
-            assert handle.task_id in toolset.task_manager.handles  # type: ignore[attr-defined]
+            assert handle.task_id in toolset.task_manager.handles
             assert handle.chat_trace_id in result
             assert len(handle.chat_trace_id) == 32
             int(handle.chat_trace_id, 16)
@@ -1566,7 +1682,7 @@ class TestChatTraceLifecycle:
             subagent_name="worker",
             description="old cancelled task",
             status=TaskStatus.CANCELLED,
-            completed_at=datetime(2020, 1, 1),
+            completed_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         )
         toolset.task_manager.handles["stale-no-usage"] = stale
 
@@ -1646,7 +1762,7 @@ class TestChatTraceLifecycle:
     async def test_check_task_shows_chat_trace_id_only_when_completed(self):
         """check_task must not advertise continuation for unfinished/failed tasks."""
         toolset = create_subagent_toolset(default_model="test")
-        tm = toolset.task_manager  # type: ignore[attr-defined]
+        tm = toolset.task_manager
         handle = TaskHandle(
             task_id="trace-vis",
             subagent_name="worker",
@@ -2624,7 +2740,7 @@ class TestToolsetFunctionsCoverage:
             # Manually inject a long-running task into the task_manager
             from subagents_pydantic_ai.types import TaskHandle
 
-            tm = toolset.task_manager  # type: ignore[attr-defined]
+            tm = toolset.task_manager
 
             async def slow_coro():
                 await asyncio.sleep(100)
@@ -2678,7 +2794,7 @@ class TestToolsetFunctionsCoverage:
 
             from subagents_pydantic_ai.types import TaskHandle
 
-            tm = toolset.task_manager  # type: ignore[attr-defined]
+            tm = toolset.task_manager
 
             async def fast_coro() -> None:
                 await asyncio.sleep(0.01)
@@ -2753,7 +2869,7 @@ class TestToolsetFunctionsCoverage:
 
             from subagents_pydantic_ai.types import TaskHandle
 
-            tm = toolset.task_manager  # type: ignore[attr-defined]
+            tm = toolset.task_manager
 
             async def failing_coro() -> None:
                 await asyncio.sleep(0.01)
@@ -2867,7 +2983,7 @@ class TestToolsetFunctionsCoverage:
             r = await task_tool.function(ctx, "slow work", "worker", "async")
             tid = r.split("Task ID: ")[1].split("\n")[0]
 
-            worker_task = toolset.task_manager.tasks[tid]  # type: ignore[attr-defined]
+            worker_task = toolset.task_manager.tasks[tid]
 
             # Schedule wait_tasks as its own task so we can cancel it from
             # outside (mimicking pydantic-ai sibling-cancel of the tool call).
@@ -2882,7 +2998,7 @@ class TestToolsetFunctionsCoverage:
 
             # And it must finish normally — proves no cascade kill happened.
             await asyncio.wait_for(worker_task, timeout=2.0)
-            handle = toolset.task_manager.get_handle(tid)  # type: ignore[attr-defined]
+            handle = toolset.task_manager.get_handle(tid)
             assert handle is not None
             assert handle.status == TaskStatus.COMPLETED
 
@@ -3164,7 +3280,7 @@ class TestCheckTaskStatusBranches:
             subagent_name="worker",
             description="test task",
             status=TaskStatus.RUNNING,
-            started_at=datetime.now(),  # This is the key - needs started_at set
+            started_at=utcnow(),  # This is the key - needs started_at set
         )
         task_manager.handles["test-task-running"] = handle
 
@@ -3530,7 +3646,7 @@ class TestUsageTracking:
         from subagents_pydantic_ai.types import TaskHandle, TaskStatus
 
         toolset = create_subagent_toolset(default_model="test")
-        tm = toolset.task_manager  # type: ignore[attr-defined]
+        tm = toolset.task_manager
         handle = TaskHandle(
             task_id="test-usage",
             subagent_name="worker",
@@ -3554,7 +3670,7 @@ class TestUsageTracking:
         from subagents_pydantic_ai.types import TaskHandle, TaskStatus
 
         toolset = create_subagent_toolset(default_model="test")
-        tm = toolset.task_manager  # type: ignore[attr-defined]
+        tm = toolset.task_manager
         handle = TaskHandle(
             task_id="test-details",
             subagent_name="worker",
@@ -3578,7 +3694,7 @@ class TestUsageTracking:
         from subagents_pydantic_ai.types import TaskHandle, TaskStatus
 
         toolset = create_subagent_toolset(default_model="test")
-        tm = toolset.task_manager  # type: ignore[attr-defined]
+        tm = toolset.task_manager
         handle = TaskHandle(
             task_id="test-history",
             subagent_name="worker",
@@ -3603,7 +3719,7 @@ class TestUsageTracking:
         from subagents_pydantic_ai.types import TaskHandle, TaskStatus
 
         toolset = create_subagent_toolset(default_model="test")
-        tm = toolset.task_manager  # type: ignore[attr-defined]
+        tm = toolset.task_manager
         handle = TaskHandle(
             task_id="wait-observe",
             subagent_name="worker",
@@ -3647,7 +3763,7 @@ class TestUsageTracking:
         from subagents_pydantic_ai.types import TaskHandle, TaskStatus
 
         toolset = create_subagent_toolset(default_model="test")
-        tm = toolset.task_manager  # type: ignore[attr-defined]
+        tm = toolset.task_manager
 
         h1 = TaskHandle(
             task_id="t1",
@@ -3674,7 +3790,7 @@ class TestUsageTracking:
         tm.handles["t2"] = h2
         tm.handles["t3"] = h3
 
-        totals = toolset.get_total_usage()  # type: ignore[attr-defined]
+        totals = toolset.get_total_usage()
         assert totals["input_tokens"] == 300
         assert totals["output_tokens"] == 150
         assert totals["total_tokens"] == 450
@@ -3686,7 +3802,7 @@ class TestUsageTracking:
         from subagents_pydantic_ai.types import TaskHandle, TaskStatus
 
         toolset = create_subagent_toolset(default_model="test")
-        tm = toolset.task_manager  # type: ignore[attr-defined]
+        tm = toolset.task_manager
         handle = TaskHandle(
             task_id="no-usage",
             subagent_name="worker",
@@ -3836,6 +3952,12 @@ class TestSendMessageToSubagent:
         toolset = self._make_toolset()
         bus = toolset.task_manager.message_bus
         bus.register_agent("subagent-run-1")
+        toolset.task_manager.handles["run-1"] = TaskHandle(
+            task_id="run-1",
+            subagent_name="helper",
+            description="d",
+            status=TaskStatus.RUNNING,
+        )
         tool = toolset.tools["send_message_to_subagent"]
         ctx = MockRunContext(deps=MockDeps())
 
@@ -3888,7 +4010,7 @@ class TestDelegationConfiguration:
     def test_invalid_configuration_is_rejected(self):
         with pytest.raises(ValueError, match="Invalid delegation_configuration"):
             create_subagent_toolset(
-                delegation_configuration="invalid",  # type: ignore[arg-type]
+                delegation_configuration="invalid",
                 include_general_purpose=False,
             )
 
@@ -4164,14 +4286,12 @@ class TestDelegationConfiguration:
 
         with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
             mock_agent_class.return_value = FakeAgent(error=Exception("delegate failed"))
-            result = await delegate_tool.function(
-                ctx,
-                description="Do work",
-                instructions="You are a worker.",
-            )
-
-        assert "Error executing task" in result
-        assert "delegate failed" in result
+            with pytest.raises(ModelRetry, match="delegate failed"):
+                await delegate_tool.function(
+                    ctx,
+                    description="Do work",
+                    instructions="You are a worker.",
+                )
 
     @pytest.mark.asyncio
     async def test_delegate_async_reports_no_chat_trace(self):
@@ -4434,7 +4554,7 @@ class TestWaitTasksResultTruncation:
     @staticmethod
     def _toolset_with_result(result: str, /, **kwargs: Any) -> tuple[Any, Any]:
         toolset = create_subagent_toolset(default_model="test", **kwargs)
-        tm = toolset.task_manager  # type: ignore[attr-defined]
+        tm = toolset.task_manager
         tm.handles["long-task"] = TaskHandle(
             task_id="long-task",
             subagent_name="worker",

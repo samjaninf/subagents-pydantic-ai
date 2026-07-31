@@ -121,7 +121,11 @@ class TestGetSubagentSystemPrompt:
         assert "cannot ask clarifying questions" not in result
 
     def test_include_dual_mode_true(self):
-        """Test with dual mode prompt included — dual mode moved to tool description."""
+        """`include_dual_mode=True` appends the execution-mode explanation.
+
+        The parameter was previously accepted and ignored, so asking for the
+        section produced a prompt without it.
+        """
         configs = [
             SubAgentConfig(
                 name="worker",
@@ -131,9 +135,23 @@ class TestGetSubagentSystemPrompt:
         ]
         result = get_subagent_system_prompt(configs, include_dual_mode=True)
 
-        # Dual mode explanation now lives in TASK_TOOL_DESCRIPTION, not system prompt
         assert "**worker**" in result
         assert "Does work" in result
+        assert "Sync Mode" in result
+        assert "Async Mode" in result
+
+    def test_dual_mode_excluded_by_default(self):
+        """The default prompt stays lean; modes are covered by the tool description."""
+        configs = [
+            SubAgentConfig(
+                name="worker",
+                description="Does work",
+                instructions="Work hard",
+            )
+        ]
+        result = get_subagent_system_prompt(configs)
+
+        assert "Sync Mode" not in result
 
     def test_include_dual_mode_false(self):
         """Test with dual mode prompt excluded."""

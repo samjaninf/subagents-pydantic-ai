@@ -1,15 +1,11 @@
 # Types API
 
+`SubAgentSpec`, the validated YAML/JSON form of a config, is on its own
+[Spec](spec.md) page.
+
 ## SubAgentConfig
 
 ::: subagents_pydantic_ai.SubAgentConfig
-    options:
-      show_root_heading: true
-      show_source: true
-
-## SubAgentSpec
-
-::: subagents_pydantic_ai.SubAgentSpec
     options:
       show_root_heading: true
       show_source: true

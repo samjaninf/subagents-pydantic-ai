@@ -436,7 +436,7 @@ Use `delegate` for ad-hoc specialists. Use `create_agent` + `task` when you need
 
 Dynamic agents cannot override pre-configured agents:
 
-```python
+```text
 # If "researcher" is pre-configured:
 create_agent(name="researcher", ...)
 # Returns: "Error: Agent 'researcher' already exists"
@@ -448,7 +448,7 @@ create_agent(name="researcher", ...)
 
 Dynamic creation has overhead. Pre-configure common agents:
 
-```python
+```text
 # Good: Pre-configure known specialists
 subagents = [
     SubAgentConfig(name="researcher", ...),
@@ -463,7 +463,7 @@ subagents = [
 
 Use descriptive names for dynamic agents:
 
-```python
+```text
 # Good
 create_agent(name="react-typescript-expert", ...)
 

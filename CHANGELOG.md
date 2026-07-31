@@ -5,6 +5,126 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Correctness, typing, and documentation pass over the whole library. Every public
+entry point keeps its name and signature, so no import or call site changes.
+
+### Fixed
+
+- **Task statuses leaked their enum member name to the model.** `TaskStatus` is a
+  `str`-mixin `Enum`, and Python 3.11 changed `Enum.__format__` for mixin enums, so
+  `check_task` reported `Status: TaskStatus.WAITING_FOR_ANSWER` on 3.11+ while the
+  tool descriptions and docs promised `waiting_for_answer`. `list_active_tasks` and
+  `wait_tasks` had the same leak. Statuses, priorities, and message types now render
+  as their values on every supported Python.
+- **Deferred tools and human approval could not work inside a subagent.**
+  `except Exception` around the run swallowed pydantic-ai's control-flow signals
+  (`CallDeferred`, `ApprovalRequired`, `SkipModelRequest`, `SkipToolValidation`,
+  `SkipToolExecution`) and turned them into a string result the parent read as a
+  finished task. Those signals, `UserError`, and a shared `UsageLimitExceeded` now
+  propagate. A background delegation cannot suspend at all, so it reports a `failed`
+  status explaining to delegate with `mode="sync"` instead.
+- **A failed delegation looked like a successful one.** A crash returned
+  `"Error executing task: ..."` as a normal tool result, so pydantic-ai's retry
+  budget never engaged and the failure could be folded into a final answer. Failures
+  now reach the parent as `ModelRetry`. See `contain_errors` and `on_failure` under
+  *Added*.
+- **Background tasks outlived their parent run.** Nothing cancelled the
+  `asyncio.Task` behind a background delegation when the run ended, so it kept
+  executing against torn-down deps, and one blocked in `ask_parent` waited out the
+  full timeout. `SubAgentCapability` now cancels its run's tasks in a `wrap_run`
+  finalizer, and `TaskManager.cancel_all()` exposes the same thing to the toolset API.
+- **Tasks were not isolated per run.** One toolset instance is typically built per
+  agent and shared by every run it serves, so any run could inspect, answer, steer,
+  or cancel another run's task by id. Handles record `parent_run_id` and the tools
+  refuse ids belonging to another run.
+- **`hard_cancel` could overwrite a completed task's result.** The guard was
+  `if not task.done()`, which is still true while the task runs its `finally`, so a
+  cancel arriving in that window replaced the real result with `cancelled`.
+  `TaskHandle.finish()` makes the first terminal transition win.
+- **The library wrote a private attribute onto the caller's deps object.**
+  `deps._subagent_state = {...}` raised `AttributeError` for a deps class declared
+  `frozen=True` or `slots=True`, both of which `SubAgentDepsProtocol` allows. The
+  state is a typed `SubAgentState` carried in a `ContextVar` instead. Reading a
+  caller-injected `deps._subagent_state` still works.
+- **Timestamps were naive local time.** `TaskHandle.created_at`, `started_at`, and
+  `completed_at` are timezone-aware UTC, so elapsed time and eviction order stay
+  correct across a DST transition.
+- **`get_subagent_system_prompt(include_dual_mode=...)` was accepted and ignored.**
+  It now appends `DUAL_MODE_SYSTEM_PROMPT` when asked. The default changed to
+  `False`, so output is unchanged for callers that never passed it.
+- **Steering could be spliced into the wrong place.** Parent-to-child steering
+  appended `UserPromptPart`s directly into a graph node's request. It now goes
+  through pydantic-ai's `AgentRun.enqueue`, so core places the parts and they can
+  never land between a tool call and its return.
+- **The retry driver had drifted from the loop it mirrors.** `Agent.run` drains the
+  wrapped event stream after the handler returns, unconditionally; the copy drained
+  only when there was no handler, leaving stream wrappers unfinished for a handler
+  that stopped reading early.
+- **409 Conflict and 425 Too Early were retried as transient.** Both signal a request
+  the server rejected on its merits, so replaying it unchanged is not expected to
+  help.
+- **A message-bus handler that raised was silently swallowed** by a bare
+  `except Exception: pass`. Failures are logged and delivery continues.
+- **`asyncio.get_event_loop()` inside a coroutine** (deprecated since 3.10) is now
+  `get_running_loop()`.
+- **Cancelling a finished task reported "not found"**, inviting the model to conclude
+  the work was lost. It now reports the task's status and points at `check_task`.
+- **`make typecheck-mypy` was broken.** The `module = "tests.*"` override never
+  matched, because `tests/` had no `__init__.py` and mypy named the modules
+  `test_toolset` rather than `tests.test_toolset`; the target reported 583 errors the
+  config intended to relax. It is green and runs in CI.
+
+### Added
+
+- **`contain_errors`** on `create_subagent_toolset`, `SubAgentCapability`, and
+  `SubAgentConfig`. Defaults to `True`: an unexpected subagent crash becomes a
+  `ModelRetry` for the parent, logged with its traceback, so one failed delegation
+  cannot abort the run. Set `False` to let crashes propagate.
+- **`on_failure`** on `SubAgentConfig`. Returns a steering message to the parent as
+  an ordinary tool result instead of raising `ModelRetry`, for a failure where
+  re-delegating is pointless.
+- **`ask_timeout_seconds`** on `create_subagent_toolset` and `SubAgentCapability`,
+  replacing a hardcoded 300-second wait in `ask_parent`.
+- **`SubAgentToolset` is a real class.** It was an alias for
+  `create_subagent_toolset`, whose result had `task_manager`,
+  `message_history_store`, and `get_total_usage` attached afterwards behind three
+  `type: ignore` comments. It is now a `FunctionToolset` subclass with those as typed
+  members, and `create_subagent_toolset()` returns an instance —
+  `SubAgentToolset(subagents=[...])`, `toolset.task_manager`, and
+  `isinstance(t, FunctionToolset)` all keep working.
+- **`TaskHandle.finish()` and `TaskHandle.is_finished`** for idempotent terminal
+  transitions, plus `TERMINAL_STATUSES` and `utcnow` as exports.
+- **`TaskManager.cancel_all()`** and **`TaskManager.resolve_answer()`**.
+
+### Changed
+
+- **`SubAgentConfig` enforces its required keys.** `name`, `description`, and
+  `instructions` were documented as required but optional to the type checker, and
+  the library indexed them directly, so a config missing one raised `KeyError` mid
+  delegation. Call sites are unchanged; both type checkers now catch it.
+- **Typing bar raised to match `pydantic-ai-harness`.** pyright runs in **strict**
+  mode, `src/` has no `type: ignore`, mypy strict covers tests as well as source, and
+  ruff's complexity ceiling dropped from 30 to 15 with no per-function `noqa`.
+  `TaskHandle.usage` is `RunUsage | None`, `finish_reason` is `FinishReason | None`,
+  and `TaskManager.handles` is `dict[str, TaskHandle]`.
+- **`ToolsetFactory` returns a `Sequence`**, so a factory annotated
+  `list[FunctionToolset[MyDeps]]` satisfies it — `list` is invariant.
+- **`toolset.py` split into focused modules** (`_execution`, `_observability`,
+  `_chat_trace`, `_state`), with the historical names still importable from
+  `subagents_pydantic_ai.toolset`.
+- **Documentation.** New pages for [observability](https://vstorm-co.github.io/subagents-pydantic-ai/concepts/observability/),
+  [steering](https://vstorm-co.github.io/subagents-pydantic-ai/advanced/steering/), [chat traces](https://vstorm-co.github.io/subagents-pydantic-ai/advanced/chat-traces/),
+  [failure handling](https://vstorm-co.github.io/subagents-pydantic-ai/advanced/errors/), and
+  [usage limits](https://vstorm-co.github.io/subagents-pydantic-ai/advanced/usage-limits/); API reference pages for the
+  registry, message bus, retry, spec, and dynamic-agent helpers; a changelog page.
+  Corrected the stale tool and feature tables on the index, the
+  `general_purpose_config` parameter that never existed, and the nesting guide's
+  claim that `max_nesting_depth` enforces a limit — it does not, the gate is what
+  `toolsets_factory` hands the child. Snippets in `docs/` and `README.md` are now
+  checked for syntax and API drift by `tests/test_docs.py`.
+
 ## [0.2.11] - 2026-07-31
 
 ### Added

@@ -56,6 +56,7 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.8.0",
     "pre-commit>=4.5.0",
+    "types-pyyaml>=6.0.12.20260724",
 ]
 docs = [
     "mkdocs>=1.6.0",
@@ -117,26 +118,29 @@ ignore = [
 ]
 
 [tool.ruff.lint.mccabe]
-max-complexity = 30  # Factory functions are intentionally complex
+max-complexity = 15
 
 [tool.ruff.format]
 quote-style = "double"
 
 [tool.pyright]
 pythonVersion = "3.10"
-typeCheckingMode = "basic"
+typeCheckingMode = "strict"
 include = ["src/subagents_pydantic_ai"]
 exclude = ["**/__pycache__", ".venv*", "site", "tests"]
 reportMissingTypeStubs = false
+# The agent slot is deliberately `Any`: consumers pass their own agent objects,
+# not a `pydantic_ai.Agent` (see `CompiledSubAgent.agent`). Reporting every use
+# of it would drown the signal from real gaps.
 reportUnknownMemberType = false
 reportUnknownArgumentType = false
 reportUnknownVariableType = false
-reportUnknownParameterType = false
+# Tools are registered through decorators and `add_function`, so pyright cannot
+# see the reference.
 reportUnusedFunction = false
+# `retry.py` mirrors the driving loop inside `Agent.run`, which has no public
+# equivalent; the coupling is documented there and covered by a drift test.
 reportPrivateUsage = false
-reportCallIssue = false
-reportAssignmentType = false
-reportTypedDictNotRequiredAccess = false
 
 [tool.mypy]
 python_version = "3.10"
@@ -145,10 +149,31 @@ warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
 
+# `tests/` needs its `__init__.py` for the override below to match: without it
+# mypy names the modules `test_toolset`, not `tests.test_toolset`, so
+# `module = "tests.*"` matched nothing and `make typecheck-mypy` reported
+# hundreds of errors the config intended to relax.
 [[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
-disable_error_code = ["arg-type", "list-item", "abstract"]
+# A test with annotated arguments but no return annotation is an *incomplete*
+# def, which `strict` reports separately from an untyped one. Relaxing only
+# `disallow_untyped_defs` left those errors in place.
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_untyped_decorators = false
+disable_error_code = [
+    "arg-type",
+    "list-item",
+    "abstract",
+    # `assert TaskStatus.PENDING == "pending"` is the point of the test, but mypy
+    # calls an enum-to-literal comparison non-overlapping.
+    "comparison-overlap",
+    # Tests read optional fields straight off a handle after asserting the state
+    # that guarantees them; narrowing each one adds noise, not safety.
+    "union-attr",
+    "operator",
+]
 
 [tool.codespell]
 skip = ".git,.venv*,uv.lock,site,htmlcov,.coverage"

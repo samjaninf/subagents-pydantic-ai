@@ -7,19 +7,50 @@ including configuration types, message types, and task management types.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic_ai import RunContext, UsageLimits
 from pydantic_ai.models import Model
 from typing_extensions import NotRequired, TypedDict
 
+if TYPE_CHECKING:
+    from pydantic_ai.messages import FinishReason
+    from pydantic_ai.toolsets import AbstractToolset
+    from pydantic_ai.usage import RunUsage
 
-class MessageType(str, Enum):
+
+def utcnow() -> datetime:
+    """The current time as a timezone-aware UTC timestamp.
+
+    Task timestamps are compared and subtracted (elapsed time, eviction order), so
+    they must be unambiguous. Naive local timestamps make that arithmetic wrong
+    across a DST transition.
+    """
+    return datetime.now(timezone.utc)
+
+
+class _ValueStrEnum(str, Enum):
+    """A `str` enum that renders as its value on every supported Python version.
+
+    Python 3.11 changed `Enum.__str__` and `Enum.__format__` for mixin enums to
+    render `ClassName.MEMBER`, so `f"{TaskStatus.COMPLETED}"` produced
+    `TaskStatus.COMPLETED` instead of `completed` and leaked the member name into
+    model-facing tool output. `enum.StrEnum` fixes this but only exists on 3.11+.
+    """
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+    def __format__(self, format_spec: str) -> str:
+        return str.__format__(str(self.value), format_spec)
+
+
+class MessageType(_ValueStrEnum):
     """Types of messages that can be sent between agents."""
 
     TASK_ASSIGNED = "task_assigned"
@@ -47,7 +78,7 @@ class MessageType(str, Enum):
     """Immediate cancellation (hard cancel)."""
 
 
-class TaskStatus(str, Enum):
+class TaskStatus(_ValueStrEnum):
     """Status of a background task."""
 
     PENDING = "pending"
@@ -96,7 +127,13 @@ DelegationConfiguration = Literal[
 """
 
 
-class TaskPriority(str, Enum):
+TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+"""Statuses a task never leaves. The first terminal transition wins."""
+
+
+class TaskPriority(_ValueStrEnum):
     """Priority levels for background tasks."""
 
     LOW = "low"
@@ -134,14 +171,18 @@ class TaskCharacteristics:
     may_need_clarification: bool = False
 
 
-ToolsetFactory = Callable[[Any], list[Any]]
+ToolsetFactory = Callable[[Any], "Sequence[AbstractToolset[Any]]"]
 """Factory function that creates toolsets for a subagent.
 
-Takes deps as input and returns a list of toolsets to register.
+Takes the subagent's deps as input and returns the toolsets to register. The deps
+parameter is `Any` because its type belongs to the application, not this library.
+The return type is a `Sequence` so a factory annotated with a concrete toolset
+type (`list[FunctionToolset[MyDeps]]`) still satisfies it -- `list` is invariant,
+`Sequence` is not.
 
 Example:
     ```python
-    def my_toolset_factory(deps: MyDeps) -> list[Any]:
+    def my_toolset_factory(deps: MyDeps) -> list[FunctionToolset[MyDeps]]:
         return [
             create_file_toolset(deps.backend),
             create_todo_toolset(),
@@ -170,7 +211,21 @@ Example:
 """
 
 
-class SubAgentConfig(TypedDict, total=False):
+class _SubAgentConfigRequired(TypedDict):
+    """The keys every `SubAgentConfig` must carry.
+
+    Split out so `total=False` on `SubAgentConfig` applies only to the optional
+    keys. The library indexes these three directly (`config["name"]`), so making
+    them optional to the type checker turned a configuration mistake into a
+    `KeyError` raised in the middle of a delegation.
+    """
+
+    name: str
+    description: str
+    instructions: str
+
+
+class SubAgentConfig(_SubAgentConfigRequired, total=False):
     """Configuration for a subagent.
 
     Defines the name, description, and instructions for a subagent.
@@ -218,6 +273,17 @@ class SubAgentConfig(TypedDict, total=False):
         retry_on: Custom predicate `(exc) -> bool` deciding whether an
             exception is transient. Defaults to the built-in classifier
             (`ModelHTTPError` 5xx/429/... and non-HTTP `ModelAPIError`).
+        on_failure: Message returned to the parent as an ordinary tool result
+            when this subagent fails, instead of raising `ModelRetry`. Use it
+            to steer the parent ("summarise from what you already have")
+            rather than letting it retry the delegation.
+        contain_errors: Whether an unexpected subagent crash is contained.
+            Defaults to `True`: the crash becomes a `ModelRetry` for the
+            parent, logged with its traceback, so one failed delegation cannot
+            abort the whole run. Set `False` to let crashes propagate.
+            Control-flow signals (`CallDeferred`, `ApprovalRequired`,
+            `Skip*`), `UserError`, and a shared `UsageLimitExceeded` always
+            propagate regardless.
 
     Example with builtin_tools:
         ```python
@@ -240,9 +306,6 @@ class SubAgentConfig(TypedDict, total=False):
         ```
     """
 
-    name: str
-    description: str
-    instructions: str
     model: NotRequired[str | Model]
     agent: NotRequired[Any]
     agent_factory: NotRequired[Callable[..., Any]]
@@ -251,7 +314,7 @@ class SubAgentConfig(TypedDict, total=False):
     preferred_mode: NotRequired[Literal["sync", "async", "auto"]]
     typical_complexity: NotRequired[Literal["simple", "moderate", "complex"]]
     typically_needs_context: NotRequired[bool]
-    toolsets: NotRequired[list[Any]]
+    toolsets: NotRequired[Sequence[AbstractToolset[Any]]]
     agent_kwargs: NotRequired[dict[str, Any]]
     context_files: NotRequired[list[str]]
     extra: NotRequired[dict[str, Any]]
@@ -261,6 +324,8 @@ class SubAgentConfig(TypedDict, total=False):
     retry_backoff_multiplier: NotRequired[float]
     retry_jitter: NotRequired[bool]
     retry_on: NotRequired[Callable[[BaseException], bool]]
+    on_failure: NotRequired[str]
+    contain_errors: NotRequired[bool]
 
 
 UsageLimitsFactory = Callable[[RunContext[Any], SubAgentConfig], "UsageLimits | None"]
@@ -297,7 +362,7 @@ class AgentMessage:
     payload: Any
     task_id: str
     id: str = field(default_factory=_generate_message_id)
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=utcnow)
     correlation_id: str | None = None
 
 
@@ -325,6 +390,9 @@ class TaskHandle:
         conversation_id: Pydantic AI conversation ID for the subagent run
         traceparent: W3C traceparent for the subagent run span, if available
         cost: Total subagent model cost calculated from genai-prices
+        parent_run_id: `run_id` of the parent run that started this task. Tools
+            use it to refuse cross-run access, and the capability uses it to
+            cancel a run's tasks when that run ends.
     """
 
     task_id: str
@@ -332,15 +400,15 @@ class TaskHandle:
     description: str
     status: TaskStatus = TaskStatus.PENDING
     priority: TaskPriority = TaskPriority.NORMAL
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=utcnow)
     started_at: datetime | None = None
     completed_at: datetime | None = None
     result: str | None = None
     error: str | None = None
     pending_question: str | None = None
     chat_trace_id: str | None = None
-    usage: Any = None
-    """Token usage from the subagent run (``RunUsage`` from pydantic-ai)."""
+    usage: RunUsage | None = None
+    """Token usage from the subagent run."""
     message_history: str | None = None
     run_id: str | None = None
     conversation_id: str | None = None
@@ -352,11 +420,47 @@ class TaskHandle:
     provider_url: str | None = None
     provider_response_id: str | None = None
     provider_details: dict[str, Any] | None = None
-    finish_reason: Any = None
+    finish_reason: FinishReason | None = None
     cost: Decimal | None = None
     tool_call_counts: dict[str, int] = field(default_factory=dict)
     retry_count: int = 0
     """Number of transient-failure retries performed for this task."""
+    parent_run_id: str | None = None
+
+    @property
+    def is_finished(self) -> bool:
+        """Whether the task reached a terminal status."""
+        return self.status in TERMINAL_STATUSES
+
+    def finish(
+        self,
+        status: TaskStatus,
+        *,
+        result: str | None = None,
+        error: str | None = None,
+    ) -> bool:
+        """Record a terminal outcome, first terminal transition winning.
+
+        Idempotence is what makes `hard_cancel` safe. A task that already set
+        `COMPLETED` and is running its `finally` block is still not
+        `asyncio.Task.done()`, so a cancel arriving in that window used to
+        overwrite the real result with `CANCELLED` and move `completed_at`.
+
+        Args:
+            status: The terminal status to record.
+            result: Result text, for a completed task.
+            error: Error text, for a failed or cancelled task.
+
+        Returns:
+            Whether this call recorded the outcome.
+        """
+        if self.is_finished:
+            return False
+        self.status = status
+        self.result = result
+        self.error = error
+        self.completed_at = utcnow()
+        return True
 
 
 @dataclass
@@ -376,7 +480,13 @@ class CompiledSubAgent:
     name: str
     description: str
     config: SubAgentConfig
-    agent: object | None = None  # Agent instance - typed as object to avoid circular imports
+    agent: Any = None
+    """The agent that runs when this subagent is delegated to.
+
+    Deliberately untyped: consumers such as pydantic-deep supply their own agent
+    objects rather than a `pydantic_ai.Agent`, so narrowing this would reject
+    valid callers. Only `run`/`iter` are ever called on it.
+    """
 
 
 def decide_execution_mode(

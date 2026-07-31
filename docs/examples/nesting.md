@@ -2,6 +2,19 @@
 
 This example shows how subagents can have their own subagents.
 
+!!! warning "Nesting is something you build, not a switch you flip"
+    A subagent can only delegate if you give it a subagent toolset, which is what
+    `toolsets_factory` is for. `max_nesting_depth` does **not** enforce a limit
+    itself: the library passes `max_nesting_depth - 1` to your deps'
+    `clone_for_subagent`, and what that means is up to your implementation. The
+    real gate is what the factory hands the child.
+
+    Note also that calling `create_subagent_toolset()` inside the factory builds a
+    fresh toolset — with its own task manager and chat-trace store — on every
+    delegation. Nested background tasks are therefore invisible to the top-level
+    `task_manager`. Build the nested toolset once, outside the factory, if you need
+    to observe them.
+
 ## Overview
 
 Subagents can delegate to other subagents, creating hierarchical workflows:
@@ -70,20 +83,20 @@ Workflow:
 
 
 def create_manager_toolsets(deps: Deps) -> list:
-    """Create toolsets for the manager, including nested delegation."""
-    return [
-        create_subagent_toolset(
-            subagents=leaf_subagents,
-            max_nesting_depth=0,  # Leaf subagents can't delegate further
-        ),
-    ]
+    """Give the manager its own subagent toolset, so it can delegate in turn.
+
+    This is what actually creates a level of nesting: the manager can only
+    delegate to the subagents this toolset exposes. The leaves get no subagent
+    toolset at all, which is what stops the hierarchy here.
+    """
+    return [create_subagent_toolset(subagents=leaf_subagents)]
 
 
 # Top-level toolset
 toolset = create_subagent_toolset(
     subagents=manager_subagents,
     toolsets_factory=create_manager_toolsets,
-    max_nesting_depth=1,  # Allow one level of nesting
+    max_nesting_depth=1,  # Budget handed to Deps.clone_for_subagent
 )
 
 agent = Agent(
@@ -252,21 +265,21 @@ class Deps:
 
 Don't nest too deeply. 2-3 levels is usually enough:
 
-```python
-# Good: Clear hierarchy
-Parent → Manager → Worker
+```text
+# Good: clear hierarchy
+Parent -> Manager -> Worker
 
-# Avoid: Too deep
-Parent → Director → Manager → Lead → Worker → Helper
+# Avoid: too deep
+Parent -> Director -> Manager -> Lead -> Worker -> Helper
 ```
 
 ### 2. Clear Responsibilities
 
 Each level should have distinct responsibilities:
 
-```python
-# Good: Clear separation
-"project-manager": Coordinates overall project
+```text
+# Good: clear separation
+"project-manager": coordinates the overall project
 "tech-lead": Makes technical decisions
 "developer": Writes code
 

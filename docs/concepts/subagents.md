@@ -132,24 +132,24 @@ SubAgentConfig(
 The `description` field is crucial - it tells the parent agent when to use each subagent:
 
 ```python
-# Good descriptions - clear about capabilities
+# Good: the description says what the subagent can actually do
 SubAgentConfig(
     name="sql-expert",
     description="Writes and optimizes SQL queries for PostgreSQL databases",
-    ...
+    instructions="You write and optimize PostgreSQL queries.",
 )
 
 SubAgentConfig(
     name="code-reviewer",
     description="Reviews Python code for bugs, security issues, and style",
-    ...
+    instructions="You review Python code and report concrete findings.",
 )
 
-# Bad descriptions - too vague
+# Bad: the parent model has no basis for choosing this over anything else
 SubAgentConfig(
     name="helper",
-    description="Helps with stuff",  # Too vague!
-    ...
+    description="Helps with stuff",
+    instructions="You help.",
 )
 ```
 
@@ -188,7 +188,7 @@ Format your response as:
 
 Each subagent should do one thing well:
 
-```python
+```text
 # Good - focused
 SubAgentConfig(name="test-writer", description="Generates pytest tests", ...)
 SubAgentConfig(name="doc-writer", description="Writes documentation", ...)
