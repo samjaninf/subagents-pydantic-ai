@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from pydantic_ai import Agent, RunContext
@@ -11,6 +12,18 @@ from subagents_pydantic_ai.protocols import SubAgentDepsProtocol
 from subagents_pydantic_ai.types import SubAgentConfig, ToolsetFactory
 
 CapabilityFactory = ToolsetFactory
+
+AgentFactory = Callable[[SubAgentConfig], Any]
+"""Builds the agent instance for a dynamically created subagent.
+
+Receives the freshly built `SubAgentConfig` and returns an agent instance. The
+return type is `Any` because the agent need not be a `pydantic_ai.Agent` —
+consumers such as pydantic-deep return their own agent objects.
+
+A factory must not attach an `ask_parent` toolset; the subagent toolset injects
+one at run time for registry-backed and one-shot agents, and a second copy would
+collide on the tool name.
+"""
 
 
 def validate_agent_name(name: str) -> str | None:
@@ -47,7 +60,7 @@ def validate_capabilities(
 
 def validate_capabilities_with_factory(
     capabilities: list[str] | None,
-    default_agent_factory: Any | None,
+    default_agent_factory: AgentFactory | None,
 ) -> str | None:
     """Return an error when capabilities cannot be injected with a custom factory."""
     if default_agent_factory is not None and capabilities:
@@ -104,7 +117,7 @@ def build_agent_instance(
     capabilities: list[str] | None,
     toolsets_factory: ToolsetFactory | None,
     capabilities_map: dict[str, CapabilityFactory] | None,
-    default_agent_factory: Any | None,
+    default_agent_factory: AgentFactory | None,
 ) -> Any:
     """Build a pydantic-ai Agent instance for a dynamic subagent."""
     if default_agent_factory is not None:
@@ -135,7 +148,7 @@ def build_dynamic_agent(
     allowed_models: list[str] | None = None,
     toolsets_factory: ToolsetFactory | None = None,
     capabilities_map: dict[str, CapabilityFactory] | None = None,
-    default_agent_factory: Any | None = None,
+    default_agent_factory: AgentFactory | None = None,
 ) -> str | tuple[Any, SubAgentConfig]:
     """Validate inputs and build a dynamic agent.
 

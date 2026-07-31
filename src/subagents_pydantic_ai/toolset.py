@@ -20,7 +20,11 @@ from pydantic_ai import Agent, RunContext, UsageLimits
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import FunctionToolset
 
-from subagents_pydantic_ai.dynamic_agent import CapabilityFactory, build_dynamic_agent
+from subagents_pydantic_ai.dynamic_agent import (
+    AgentFactory,
+    CapabilityFactory,
+    build_dynamic_agent,
+)
 from subagents_pydantic_ai.message_bus import InMemoryMessageBus, TaskManager
 from subagents_pydantic_ai.prompts import (
     ANSWER_SUBAGENT_DESCRIPTION,
@@ -395,14 +399,14 @@ def create_subagent_toolset(  # noqa: C901
     include_general_purpose: bool = True,
     max_nesting_depth: int = 0,
     id: str | None = None,
-    registry: Any | None = None,
+    registry: DynamicAgentRegistry | None = None,
     descriptions: dict[str, str] | None = None,
     ask_user: AskUserCallback | None = None,
     usage_limits: UsageLimits | UsageLimitsFactory | None = None,
     delegation_configuration: DelegationConfiguration = "default",
     allowed_models: list[str] | None = None,
     capabilities_map: dict[str, CapabilityFactory] | None = None,
-    default_agent_factory: Any | None = None,
+    default_agent_factory: AgentFactory | None = None,
     max_agents: int = 10,
     max_chat_traces: int = 100,
     max_task_handles: int = 500,
@@ -456,6 +460,13 @@ def create_subagent_toolset(  # noqa: C901
             Async task lifecycle tools remain available in every mode.
             Custom factories that already attach `ask_parent` should not do so;
             the toolset injects it at run time for registry-backed agents.
+            A mode that hides a tool rejects that tool's configuration rather
+            than ignoring it — see `Raises`.
+            `"persisted"` and `"persisted_and_oneshot"` expose a `create_agent`
+            tool of their own, so they cannot be combined with
+            `create_agent_factory_toolset` on one agent (pydantic-ai rejects the
+            duplicate tool name). Use `"default"` and let the factory toolset own
+            agent creation when you also want its `remove_agent`.
         allowed_models: Optional model allow-list for dynamically created specialists.
         capabilities_map: Optional capability factories for dynamically created
             specialists.
@@ -463,7 +474,9 @@ def create_subagent_toolset(  # noqa: C901
             created specialists. When set, requested `capabilities` are rejected.
             Do not attach an `ask_parent` toolset in the factory; the toolset
             injects it at run time when needed.
-        max_agents: Maximum number of persistent dynamic agents.
+        max_agents: Maximum number of persistent dynamic agents, applied to the
+            registry this toolset creates for `create_agent`. Ignored when
+            `registry` is passed — that registry keeps its own `max_agents`.
         max_chat_traces: Maximum number of chat traces (subagent conversations)
             whose message history is kept in memory for continuation via
             `chat_trace_id`. Least-recently-used traces are evicted past this
@@ -484,9 +497,13 @@ def create_subagent_toolset(  # noqa: C901
         FunctionToolset configured with subagent management tools.
 
     Raises:
-        ValueError: If `max_result_chars` is negative, or
-            `delegation_configuration` is invalid, or
-            `oneshot_only` is combined with non-empty `subagents`.
+        ValueError: If `max_result_chars` is negative; if
+            `delegation_configuration` is invalid; if `"oneshot_only"` is
+            combined with `subagents` or a `registry`, neither of which is
+            reachable without `task`; or if a mode exposing neither
+            `create_agent` nor `delegate` is given `allowed_models`,
+            `capabilities_map`, or `default_agent_factory`, which only those
+            tools consult.
 
     Example:
         ```python
@@ -522,24 +539,63 @@ def create_subagent_toolset(  # noqa: C901
             f"Expected one of: {valid}"
         )
 
-    if delegation_configuration == "oneshot_only" and subagents:
-        raise ValueError(
-            "delegation_configuration='oneshot_only' cannot be combined with "
-            "non-empty subagents; configured subagents would be unreachable. "
-            "Omit subagents, or use a mode that exposes the task tool."
-        )
+    expose_create_agent = delegation_configuration in {
+        "persisted",
+        "persisted_and_oneshot",
+    }
+    expose_task = delegation_configuration != "oneshot_only"
+    expose_delegate = delegation_configuration in {
+        "persisted_and_oneshot",
+        "oneshot_only",
+    }
+
+    # Hiding a tool also hides everything only that tool reads, so configuration
+    # for a hidden tool can never take effect. Rejecting it here surfaces the
+    # contradiction at construction, where the caller can still see their own
+    # arguments; dropping it silently only shows up as a subagent that ignores
+    # an allow-list, or a capability the model is never offered.
+    if not expose_task:
+        if subagents:
+            raise ValueError(
+                f"delegation_configuration={delegation_configuration!r} cannot be combined "
+                "with non-empty subagents; configured subagents would be unreachable "
+                "without the task tool. Omit subagents, or use a mode that exposes task."
+            )
+        if registry is not None:
+            raise ValueError(
+                f"delegation_configuration={delegation_configuration!r} cannot be combined "
+                "with a registry; registry-backed agents are only reachable through the "
+                "task tool. Omit registry, or use a mode that exposes task."
+            )
+
+    if not expose_create_agent and not expose_delegate:
+        unreachable = [
+            name
+            for name, value in (
+                ("allowed_models", allowed_models),
+                ("capabilities_map", capabilities_map),
+                ("default_agent_factory", default_agent_factory),
+            )
+            if value is not None
+        ]
+        if unreachable:
+            raise ValueError(
+                f"delegation_configuration={delegation_configuration!r} exposes no "
+                f"dynamic-agent tool, so {', '.join(unreachable)} would be ignored. "
+                "Use 'persisted', 'persisted_and_oneshot', or 'oneshot_only'."
+            )
 
     if max_result_chars is not None and max_result_chars < 0:
         raise ValueError(f"max_result_chars must be >= 0 or None, got {max_result_chars}")
 
     _descs = descriptions or {}
-    active_registry: Any = (
+    active_registry = (
         registry if registry is not None else DynamicAgentRegistry(max_agents=max_agents)
     )
 
     # Build subagent configs
     configs: list[SubAgentConfig] = list(subagents) if subagents else []
-    if include_general_purpose and delegation_configuration != "oneshot_only":
+    if include_general_purpose and expose_task:
         configs.append(_create_general_purpose_config())
 
     # Compile subagents
@@ -596,16 +652,6 @@ def create_subagent_toolset(  # noqa: C901
         else "No predefined capabilities available"
     )
 
-    expose_create_agent = delegation_configuration in {
-        "persisted",
-        "persisted_and_oneshot",
-    }
-    expose_task = delegation_configuration != "oneshot_only"
-    expose_delegate = delegation_configuration in {
-        "persisted_and_oneshot",
-        "oneshot_only",
-    }
-
     async def execute_compiled_subagent(
         ctx: RunContext[SubAgentDepsProtocol],
         subagent: CompiledSubAgent,
@@ -619,8 +665,16 @@ def create_subagent_toolset(  # noqa: C901
         inject_ask_parent: bool = False,
         task_id: str | None = None,
         chat_trace_id: str | None = None,
+        persist_chat_trace: bool = True,
     ) -> str:
-        """Run a compiled subagent with chat-trace and observability support."""
+        """Run a compiled subagent with chat-trace and observability support.
+
+        `persist_chat_trace` must be `False` for a subagent the orchestrator
+        cannot address by name later — a one-shot specialist. A chat trace is
+        only worth handing out if `task` can resolve the subagent it belongs to,
+        and storing one costs a slot in the `max_chat_traces` LRU that a
+        continuable conversation would otherwise keep.
+        """
         config = subagent.config
         agent = subagent.agent
 
@@ -668,6 +722,12 @@ def create_subagent_toolset(  # noqa: C901
             while len(message_history_store) > max_chat_traces:
                 message_history_store.popitem(last=False)
 
+        # A one-shot run exposes no chat trace, so it neither stores history nor
+        # reports an id: `handle.chat_trace_id` stays `None` and check_task /
+        # wait_tasks skip it for the same reason the returned text does.
+        on_history = save_message_history if persist_chat_trace else None
+        reported_chat_trace_id = effective_chat_trace_id if persist_chat_trace else None
+
         evict_finished_handles()
 
         if mode == "auto":
@@ -688,7 +748,7 @@ def create_subagent_toolset(  # noqa: C901
                 description=description,
                 status=TaskStatus.RUNNING,
                 priority=priority,
-                chat_trace_id=effective_chat_trace_id,
+                chat_trace_id=reported_chat_trace_id,
                 started_at=datetime.now(),
             )
             task_manager.handles[actual_task_id] = handle
@@ -705,11 +765,13 @@ def create_subagent_toolset(  # noqa: C901
                     usage_limits=resolved_usage_limits,
                     handle=handle,
                     message_history=message_history,
-                    on_message_history=save_message_history,
+                    on_message_history=on_history,
                 )
             finally:
                 active_chat_traces.discard(chat_trace_key)
-            if handle.status != TaskStatus.FAILED or chat_trace_key in message_history_store:
+            if persist_chat_trace and (
+                handle.status != TaskStatus.FAILED or chat_trace_key in message_history_store
+            ):
                 return _format_chat_trace_result(result, effective_chat_trace_id)
             return result
 
@@ -726,9 +788,9 @@ def create_subagent_toolset(  # noqa: C901
                 extra_toolsets=runtime_toolsets,
                 priority=priority,
                 usage_limits=resolved_usage_limits,
-                chat_trace_id=effective_chat_trace_id,
+                chat_trace_id=reported_chat_trace_id,
                 message_history=message_history,
-                on_message_history=save_message_history,
+                on_message_history=on_history,
                 on_run_finished=lambda: active_chat_traces.discard(chat_trace_key),
             )
         except BaseException:
@@ -821,8 +883,8 @@ def create_subagent_toolset(  # noqa: C901
             if subagent_type in compiled:
                 subagent = compiled[subagent_type]
                 inject_ask_parent = False
-            elif active_registry.get_compiled(subagent_type):
-                subagent = active_registry.get_compiled(subagent_type)
+            elif (registry_subagent := active_registry.get_compiled(subagent_type)) is not None:
+                subagent = registry_subagent
                 inject_ask_parent = True
             else:
                 available_names = list(compiled.keys())
@@ -906,6 +968,7 @@ def create_subagent_toolset(  # noqa: C901
                 may_need_clarification=may_need_clarification,
                 inject_ask_parent=True,
                 task_id=task_id,
+                persist_chat_trace=False,
             )
 
     @toolset.tool(description=_descs.get("check_task", CHECK_TASK_DESCRIPTION))

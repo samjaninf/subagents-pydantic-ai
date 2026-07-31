@@ -15,11 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `"persisted_and_oneshot"`: `create_agent` + `task` + `delegate`
   - `"oneshot_only"`: `delegate` only
   The ephemeral `delegate` path bypasses the registry, while `create_agent` stores reusable specialists for later `task` calls. Shared dynamic-agent validation and construction logic lives in `dynamic_agent.py`.
-- **`"oneshot_only"` rejects a non-empty `subagents` list at construction time.** Without `task` there is no way to reach a configured subagent, so combining the two would compile agents the model can never call. `create_subagent_toolset` (and `SubAgentCapability`) now raise `ValueError` instead of silently dropping the configuration.
+- **A delegation mode rejects configuration it cannot reach.** Hiding a tool also hides everything that only that tool consults, so `create_subagent_toolset` (and `SubAgentCapability`) now raise `ValueError` at construction rather than dropping the configuration in silence: `"oneshot_only"` rejects `subagents` and `registry` (both reachable only through `task`), and `"default"` rejects `allowed_models`, `capabilities_map`, and `default_agent_factory` (consulted only by `create_agent` and `delegate`).
+- **`AgentFactory` type alias** for `default_agent_factory`, replacing `Any` on `create_subagent_toolset`, `create_agent_factory_toolset`, and `SubAgentCapability`. `registry` is likewise typed `DynamicAgentRegistry | None` now that the toolset depends on that interface directly.
 
 ### Fixed
 
 - **Registry-backed agents now receive `ask_parent` at run time.** Dynamic agents created via the registry previously lacked the `ask_parent` toolset that statically compiled subagents get, so `can_ask_questions` was effectively a no-op for them. The toolset now injects `ask_parent` when executing registry-backed (and one-shot) agents. Custom `default_agent_factory` implementations should not attach their own `ask_parent` toolset, or the tool name will be duplicated at run time.
+- **One-shot `delegate` no longer reports or stores a chat trace.** A `Chat Trace ID` is only redeemable if `task` can resolve the subagent it belongs to, and a one-shot specialist is never registered — so the id it handed back could not be used from any mode, while its saved history still consumed a slot in the `max_chat_traces` LRU and evicted conversations that *were* continuable. One-shot runs now leave `handle.chat_trace_id` unset, omit the id from `delegate` / `check_task` / `wait_tasks` output, and never write to the history store.
+- **Documented pairing of `create_subagent_toolset` with `create_agent_factory_toolset`.** The previous recipe in `docs/advanced/dynamic-agents.md` combined `"persisted"` with the factory toolset, which pydantic-ai rejects at run time because both define a `create_agent` tool, and let `create_agent_factory_toolset` silently overwrite the registry's `max_agents`. The documented setup now keeps the subagent toolset task-only and passes the limit to the toolset that owns creation.
 
 ## [0.2.10] - 2026-07-24
 
@@ -56,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Require `pydantic-ai-slim>=2.0`** (was `>=1.74.0`): the package now targets the 2.0 API (`result.usage` property; context-less tools registered via `tool_plain`, which 2.0 made a hard requirement rather than a deprecation).
+
+## [0.2.7] - 2026-06-04
+
+### Added
+
+- **Unprompted parent -> child steering via `send_message_to_subagent`** ([#28](https://github.com/vstorm-co/subagents-pydantic-ai/issues/28)). A parent agent can now steer a running **async** subagent mid-flight without cancelling it — e.g. "narrow the search to `packages/sparta/`, it isn't in `core/`" — so the subagent adapts on its next step while keeping all partial progress, instead of the lossy cancel-and-respawn pattern. The new `send_message_to_subagent(task_id, message)` tool enqueues a `TASK_UPDATE` on the message bus for `subagent-{task_id}`; the run loop drains it at the next model-request boundary (`_drive_run` gained an `inject_messages` hook alongside the existing `cancel_check`) and folds each message into that request as an extra `UserPromptPart`. Injecting only at model-request boundaries guarantees a steering part is never spliced into a tool-call/tool-return pair. This is distinct from `answer_subagent`, which only replies to a question the subagent already asked via `ask_parent`. Sending to a finished or unknown task returns a clear error. Honoured on the retry-driven run path (`max_retries > 0`, the default); the legacy `agent.run()` fast path (`max_retries == 0`) does not expose node boundaries, so steering messages stay queued there.
+
 ## [0.2.6] - 2026-06-01
 
 ### Changed

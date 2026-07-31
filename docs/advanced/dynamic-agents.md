@@ -316,31 +316,56 @@ Prevent unlimited agent creation when the toolset creates its internal registry:
 
 ```python
 create_subagent_toolset(
+    delegation_configuration="persisted",
     max_agents=3,  # Maximum 3 dynamic agents
 )
 ```
 
 After reaching the limit, creating new agents will fail until existing ones are removed.
 
-`create_subagent_toolset` exposes no `remove_agent` tool, so a parent using
-`"persisted"` or `"persisted_and_oneshot"` cannot free a slot on its own once
-`max_agents` is hit. Pair it with `create_agent_factory_toolset` over a shared
-registry when the parent should manage its own agents:
+`max_agents` only applies to the registry `create_subagent_toolset` builds for
+itself. Pass your own `registry` and it keeps its own cap instead.
+
+#### Letting the parent free a slot
+
+`create_subagent_toolset` exposes no `remove_agent` tool, so a parent in
+`"persisted"` or `"persisted_and_oneshot"` cannot free a slot once `max_agents`
+is hit — it is told to remove an agent with no tool to do it. Give it the
+management tools from `create_agent_factory_toolset` over a shared registry, and
+leave the subagent toolset on `"default"`:
 
 ```python
-registry = DynamicAgentRegistry(max_agents=3)
+registry = DynamicAgentRegistry()
 
 agent = Agent(
     "openai:gpt-4o",
     toolsets=[
-        create_subagent_toolset(
-            registry=registry,
-            delegation_configuration="persisted",
-        ),
-        create_agent_factory_toolset(registry=registry),
+        # Task-only. Creating, listing and removing agents lives in the factory
+        # toolset, the only one that exposes `remove_agent`.
+        create_subagent_toolset(registry=registry),
+        create_agent_factory_toolset(registry=registry, max_agents=3),
     ],
 )
 ```
+
+Agents the parent creates are immediately reachable through `task`, because both
+toolsets share one registry.
+
+!!! warning "One owner for `create_agent`"
+
+    Do not combine `"persisted"` or `"persisted_and_oneshot"` with
+    `create_agent_factory_toolset`. Both define a tool named `create_agent`, and
+    pydantic-ai rejects duplicate tool names across toolsets at run time:
+
+    ```
+    UserError: FunctionToolset 'agent_factory' defines a tool whose name conflicts
+    with existing tool from FunctionToolset 'subagents': 'create_agent'.
+    ```
+
+    Pick one owner for agent creation: `"persisted"` for creation without
+    management, or `"default"` plus the factory toolset for both. Note that
+    `create_agent_factory_toolset` writes its `max_agents` onto the registry, so
+    pass the limit there rather than to `DynamicAgentRegistry(...)`.
 
 ## Delegation Modes
 
@@ -354,8 +379,15 @@ agent = Agent(
 | `"oneshot_only"` | `delegate` | Minimal one-shot delegation |
 
 Async lifecycle tools such as `check_task` remain available in every mode.
-`"oneshot_only"` rejects a non-empty `subagents` list at construction time,
-because those agents would be unreachable without `task`.
+
+A mode that hides a tool also hides that tool's configuration, so passing
+configuration the mode can never consult raises `ValueError` at construction
+instead of being dropped in silence:
+
+| Mode | Rejects | Because |
+|------|---------|---------|
+| `"oneshot_only"` | `subagents`, `registry` | Only `task` can reach either |
+| `"default"` | `allowed_models`, `capabilities_map`, `default_agent_factory` | Only `create_agent` / `delegate` consult them |
 
 Custom `default_agent_factory` implementations should not attach an
 `ask_parent` toolset; the toolset injects it at run time for registry-backed
@@ -392,6 +424,11 @@ One-shot specialists are **ephemeral**:
 - They do **not** count toward `max_agents`
 - They cannot be reused via `task(subagent_type=...)`
 - An internal name like `oneshot-{task_id}` is generated for logging and async task handles
+- They report **no chat trace**. A `Chat Trace ID` is only useful if `task` can
+  resolve the subagent it belongs to, which is never true for a one-shot, so
+  `delegate` results omit it and one-shot runs never occupy a slot in the
+  `max_chat_traces` LRU that a continuable conversation could use. Use
+  `create_agent` + `task` when you want a resumable conversation.
 
 Use `delegate` for ad-hoc specialists. Use `create_agent` + `task` when you need a reusable agent that persists in the registry.
 

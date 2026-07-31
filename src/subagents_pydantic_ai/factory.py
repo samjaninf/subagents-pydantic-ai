@@ -13,6 +13,7 @@ from pydantic_ai.models import Model
 from pydantic_ai.toolsets import FunctionToolset
 
 from subagents_pydantic_ai.dynamic_agent import (
+    AgentFactory,
     CapabilityFactory,
     build_dynamic_agent,
 )
@@ -29,7 +30,7 @@ def create_agent_factory_toolset(
     toolsets_factory: ToolsetFactory | None = None,
     capabilities_map: dict[str, CapabilityFactory] | None = None,
     id: str | None = None,
-    default_agent_factory: Any | None = None,
+    default_agent_factory: AgentFactory | None = None,
 ) -> FunctionToolset[Any]:
     """Create a toolset for dynamic agent creation.
 
@@ -42,13 +43,19 @@ def create_agent_factory_toolset(
         allowed_models: List of allowed model names. If None, any model
             is allowed.
         default_model: Default model to use when not specified.
-        max_agents: Maximum number of dynamic agents allowed.
+        max_agents: Maximum number of dynamic agents allowed. This is written
+            onto `registry.max_agents`, so it wins over whatever cap the
+            registry was constructed with — pass it explicitly when the limit
+            matters.
         toolsets_factory: Factory to create toolsets for new agents.
             Takes priority over capabilities if both are provided.
         capabilities_map: Mapping of capability names to factory functions.
             E.g., {"filesystem": create_fs_toolset, "todo": create_todo_toolset}.
             Used when capabilities are specified in create_agent.
         id: Optional toolset ID. Defaults to "agent_factory".
+        default_agent_factory: Optional builder for created agents, replacing the
+            default plain `pydantic_ai.Agent`. When set, `create_agent` rejects
+            requested `capabilities`, since the factory owns the agent's toolsets.
 
     Returns:
         FunctionToolset with agent management tools.

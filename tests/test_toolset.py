@@ -4028,7 +4028,9 @@ class TestDelegationConfiguration:
                 instructions="You are a data analyst.",
             )
 
-        assert result.startswith("oneshot result\n\nChat Trace ID: ")
+        # No chat trace: a one-shot specialist is unreachable from `task`, so an
+        # id the orchestrator cannot redeem would only invite a failed retry.
+        assert result == "oneshot result"
 
     @pytest.mark.asyncio
     async def test_delegate_does_not_register_agent(self, registry):
@@ -4049,7 +4051,7 @@ class TestDelegationConfiguration:
                 instructions="You are a worker.",
             )
 
-        assert result.startswith("oneshot result\n\nChat Trace ID: ")
+        assert result == "oneshot result"
         assert registry.count() == 0
 
     @pytest.mark.asyncio
@@ -4079,7 +4081,7 @@ class TestDelegationConfiguration:
                 instructions="You are a worker.",
             )
 
-        assert result.startswith("still works\n\nChat Trace ID: ")
+        assert result == "still works"
         assert registry.count() == 1
 
     @pytest.mark.asyncio
@@ -4170,6 +4172,134 @@ class TestDelegationConfiguration:
 
         assert "Error executing task" in result
         assert "delegate failed" in result
+
+    @pytest.mark.asyncio
+    async def test_delegate_async_reports_no_chat_trace(self):
+        """An async one-shot handle carries no trace, so neither listing shows one."""
+        toolset = create_subagent_toolset(
+            delegation_configuration="persisted_and_oneshot",
+            include_general_purpose=False,
+        )
+        ctx = MockRunContext(deps=MockDeps())
+
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
+            mock_agent_class.return_value = FakeAgent(
+                result=MockResultWithMessages("async oneshot", messages=["m"])
+            )
+            start_result = await toolset.tools["delegate"].function(
+                ctx,
+                description="Long analysis",
+                instructions="You are an analyst.",
+                mode="async",
+            )
+
+        assert "Chat Trace ID" not in start_result
+        task_id = start_result.split("Task ID: ")[1].split("\n")[0]
+
+        waited = await toolset.tools["wait_tasks"].function(ctx, [task_id], timeout=5.0)
+        assert "COMPLETED" in waited
+        assert "Chat Trace ID" not in waited
+
+        status = await toolset.tools["check_task"].function(ctx, task_id)
+        assert "Chat Trace ID" not in status
+        assert toolset.task_manager.get_handle(task_id).chat_trace_id is None
+
+    @pytest.mark.asyncio
+    async def test_delegate_does_not_evict_resumable_chat_traces(self):
+        """One-shot runs must not spend slots in the bounded chat-trace LRU.
+
+        Regression test: they used to save history under a key nothing could
+        resolve, so a burst of `delegate` calls flushed the conversations a
+        `task` subagent could actually continue.
+        """
+        researcher = FakeAgent(result=MockResultWithMessages("researched", messages=["m1"]))
+        toolset = create_subagent_toolset(
+            subagents=[
+                SubAgentConfig(
+                    name="researcher",
+                    description="Researches topics",
+                    instructions="You research.",
+                    agent=researcher,
+                )
+            ],
+            delegation_configuration="persisted_and_oneshot",
+            include_general_purpose=False,
+            max_chat_traces=1,
+        )
+        ctx = MockRunContext(deps=MockDeps())
+
+        started = await toolset.tools["task"].function(
+            ctx, description="research X", subagent_type="researcher"
+        )
+        trace_id = started.split("Chat Trace ID: ")[1].strip()
+
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
+            mock_agent_class.return_value = FakeAgent(
+                result=MockResultWithMessages("oneshot", messages=["m2"])
+            )
+            for _ in range(3):
+                await toolset.tools["delegate"].function(
+                    ctx, description="unrelated job", instructions="You are a specialist."
+                )
+
+        resumed = await toolset.tools["task"].function(
+            ctx,
+            description="follow up",
+            subagent_type="researcher",
+            chat_trace_id=trace_id,
+        )
+        assert not resumed.startswith("Error:")
+        assert researcher.iter_calls[-1]["message_history"] == ["m1"]
+
+
+class TestDelegationConfigurationRejectsUnreachableConfig:
+    """A hidden tool must not leave its configuration silently inert."""
+
+    def test_oneshot_only_rejects_registry(self):
+        with pytest.raises(ValueError, match="cannot be combined with a registry"):
+            create_subagent_toolset(
+                delegation_configuration="oneshot_only",
+                registry=DynamicAgentRegistry(),
+            )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [
+            ({"allowed_models": ["openai:gpt-4.1"]}, "allowed_models"),
+            ({"capabilities_map": {"filesystem": lambda deps: []}}, "capabilities_map"),
+            ({"default_agent_factory": lambda config: MagicMock()}, "default_agent_factory"),
+        ],
+    )
+    def test_default_mode_rejects_dynamic_agent_config(
+        self, kwargs: dict[str, Any], expected: str
+    ) -> None:
+        with pytest.raises(ValueError, match=f"exposes no dynamic-agent tool.*{expected}"):
+            create_subagent_toolset(include_general_purpose=False, **kwargs)
+
+    def test_error_lists_every_unreachable_argument(self):
+        with pytest.raises(ValueError) as exc_info:
+            create_subagent_toolset(
+                include_general_purpose=False,
+                allowed_models=["openai:gpt-4.1"],
+                capabilities_map={"filesystem": lambda deps: []},
+                default_agent_factory=lambda config: MagicMock(),
+            )
+        assert "allowed_models, capabilities_map, default_agent_factory" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "delegation_configuration",
+        ["persisted", "persisted_and_oneshot", "oneshot_only"],
+    )
+    def test_modes_with_a_dynamic_agent_tool_accept_the_config(
+        self, delegation_configuration: Any
+    ) -> None:
+        toolset = create_subagent_toolset(
+            delegation_configuration=delegation_configuration,
+            include_general_purpose=False,
+            allowed_models=["openai:gpt-4.1"],
+            capabilities_map={"filesystem": lambda deps: []},
+        )
+        assert {"create_agent", "delegate"} & set(toolset.tools)
 
 
 class TestObservabilityHelpers:

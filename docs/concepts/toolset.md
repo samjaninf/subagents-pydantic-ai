@@ -138,10 +138,13 @@ task(
 
 #### Stateful conversations (`chat_trace_id`)
 
-Every successful task result ends with a `Chat Trace ID: <id>` line. Passing
+Every successful `task()` result ends with a `Chat Trace ID: <id>` line. Passing
 that ID back to `task()` resumes the same subagent conversation: the subagent
 sees the full message history of its previous run and continues from there.
 Omit `chat_trace_id` to start a fresh conversation.
+
+`delegate()` results carry no trace ID, because a one-shot specialist is never
+registered and so cannot be named in a follow-up `task()` call.
 
 ```python
 # First task — a new conversation is created automatically:
@@ -167,7 +170,8 @@ Rules and limits:
   first run failed) returns an error instead of silently starting over.
 - Only the `max_chat_traces` most recently used conversations are kept
   (default 100, configurable on `create_subagent_toolset`); older ones are
-  evicted to bound memory in long-lived sessions.
+  evicted to bound memory in long-lived sessions. One-shot `delegate` runs are
+  not stored, so they never evict a conversation you can still continue.
 - History grows with every continuation — the full prior conversation is
   replayed on each resumed run, so long traces cost more tokens per call.
 

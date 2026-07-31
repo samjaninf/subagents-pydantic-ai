@@ -10,7 +10,7 @@ import pytest
 from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.models.test import TestModel
 
-from subagents_pydantic_ai import SubAgentCapability, SubAgentConfig
+from subagents_pydantic_ai import DynamicAgentRegistry, SubAgentCapability, SubAgentConfig
 
 _MODEL = TestModel()
 
@@ -160,6 +160,18 @@ class TestSubAgentCapability:
                     )
                 ],
             )
+
+    def test_oneshot_only_rejects_registry(self):
+        with pytest.raises(ValueError, match="cannot be combined with a registry"):
+            _cap(
+                delegation_configuration="oneshot_only",
+                registry=DynamicAgentRegistry(),
+            )
+
+    def test_default_mode_rejects_dynamic_agent_config(self):
+        """The capability is the entry point most users configure, so it must reject too."""
+        with pytest.raises(ValueError, match="exposes no dynamic-agent tool"):
+            _cap(allowed_models=["openai:gpt-4.1"])
 
     def test_max_result_chars_defaults_to_2000(self):
         """The result preview budget defaults to 2000 characters."""
