@@ -584,6 +584,53 @@ class SubAgentToolset(FunctionToolset[Any]):
         """Cancel every background task started by `run_id` and await its cleanup."""
         await self.task_manager.cancel_all(run_id)
 
+    def answer_task(self, task_id: str, answer: str) -> bool:
+        """Answer a background task blocked in `ask_parent`, from Python.
+
+        The programmatic half of the `answer_subagent` tool, for an application
+        that drives delegation itself rather than letting a model call the tools.
+        Unlike the tool, it performs no run scoping: the caller already knows which
+        task it owns.
+
+        Args:
+            task_id: The task waiting for an answer.
+            answer: The answer to deliver.
+
+        Returns:
+            Whether a waiting `ask_parent` call was resolved. `False` means the
+            task was not waiting -- it may have finished, or never asked.
+        """
+        return self.task_manager.resolve_answer(task_id, answer)
+
+    async def steer_task(self, task_id: str, message: str) -> bool:
+        """Steer a running background task, from Python.
+
+        The programmatic half of the `send_message_to_subagent` tool. The message
+        is folded into the subagent's next model request, so it adapts without
+        losing partial progress.
+
+        Args:
+            task_id: The running task to steer.
+            message: The steering instruction.
+
+        Returns:
+            Whether the message was queued. `False` means the task is not running,
+            so there is no next model request to deliver into.
+        """
+        agent_id = f"subagent-{task_id}"
+        if not self.task_manager.message_bus.is_registered(agent_id):
+            return False
+        await self.task_manager.message_bus.send(
+            AgentMessage(
+                type=MessageType.TASK_UPDATE,
+                sender="parent",
+                receiver=agent_id,
+                payload={"message": message},
+                task_id=task_id,
+            )
+        )
+        return True
+
     # -- delegation ------------------------------------------------------------
 
     async def _execute(
@@ -967,7 +1014,7 @@ class SubAgentToolset(FunctionToolset[Any]):
         if handle.status != TaskStatus.WAITING_FOR_ANSWER:
             return f"Error: Task '{task_id}' is not waiting for an answer (status: {handle.status})"
 
-        if self.task_manager.resolve_answer(task_id, answer):
+        if self.answer_task(task_id, answer):
             return f"Answer sent to task '{task_id}'"
 
         return "Error: Could not send answer - subagent is no longer waiting"
@@ -993,23 +1040,13 @@ class SubAgentToolset(FunctionToolset[Any]):
         if handle is None:
             return f"Error: Task '{task_id}' not found"
 
-        agent_id = f"subagent-{task_id}"
-        if not self.task_manager.message_bus.is_registered(agent_id):
+        if not await self.steer_task(task_id, message):
             return (
                 f"Error: Task '{task_id}' is not accepting messages "
                 f"(status: {handle.status}). Steering only works for running "
                 "async tasks."
             )
 
-        await self.task_manager.message_bus.send(
-            AgentMessage(
-                type=MessageType.TASK_UPDATE,
-                sender="parent",
-                receiver=agent_id,
-                payload={"message": message},
-                task_id=task_id,
-            )
-        )
         return (
             f"Message delivered to task '{task_id}'; "
             "it will be applied on the subagent's next step."

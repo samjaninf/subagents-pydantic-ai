@@ -48,10 +48,10 @@ class TestSubAgentDepsProtocol:
         assert "agent1" in cloned.subagents
 
     def test_invalid_implementation(self):
-        """Objects without required attributes should not satisfy protocol."""
+        """An object without `clone_for_subagent` does not satisfy the protocol."""
 
         class InvalidDeps:
-            pass
+            subagents: dict[str, Any] = {}
 
         deps = InvalidDeps()
         assert not isinstance(deps, SubAgentDepsProtocol)
@@ -83,3 +83,53 @@ class TestMessageBusProtocol:
 
         bus = InvalidBus()
         assert not isinstance(bus, MessageBusProtocol)
+
+
+class TestDepsWithoutSubagentsField:
+    """A deps class need not carry a `subagents` dict.
+
+    The protocol used to require one, so every application declared a field the
+    library never read.
+    """
+
+    def test_minimal_deps_satisfies_the_protocol(self):
+        @dataclass(frozen=True, slots=True)
+        class MinimalDeps:
+            def clone_for_subagent(self, max_depth: int = 0) -> MinimalDeps:
+                return MinimalDeps()
+
+        deps = MinimalDeps()
+
+        assert isinstance(deps, SubAgentDepsProtocol)
+        assert not hasattr(deps, "subagents")
+
+    async def test_minimal_deps_can_run_a_delegation(self):
+        from pydantic_ai.models.test import TestModel
+
+        from subagents_pydantic_ai import SubAgentConfig, create_subagent_toolset
+
+        @dataclass(frozen=True, slots=True)
+        class MinimalDeps:
+            def clone_for_subagent(self, max_depth: int = 0) -> MinimalDeps:
+                return MinimalDeps()
+
+        @dataclass
+        class Ctx:
+            deps: MinimalDeps
+            run_id: str | None = "run-1"
+
+        toolset = create_subagent_toolset(
+            subagents=[
+                SubAgentConfig(
+                    name="worker",
+                    description="Works",
+                    instructions="You work.",
+                )
+            ],
+            include_general_purpose=False,
+            default_model=TestModel(call_tools=[], custom_output_text="done"),
+        )
+
+        result = await toolset.tools["task"].function(Ctx(deps=MinimalDeps()), "do it", "worker")
+
+        assert "done" in result

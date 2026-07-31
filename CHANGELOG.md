@@ -97,6 +97,26 @@ entry point keeps its name and signature, so no import or call site changes.
 - **`TaskHandle.finish()` and `TaskHandle.is_finished`** for idempotent terminal
   transitions, plus `TERMINAL_STATUSES` and `utcnow` as exports.
 - **`TaskManager.cancel_all()`** and **`TaskManager.resolve_answer()`**.
+- **`SubAgentToolset.answer_task()` and `SubAgentToolset.steer_task()`** — the
+  Python halves of the `answer_subagent` and `send_message_to_subagent` tools, for
+  an application that drives delegation itself instead of letting a model call the
+  tools. Both return a `bool` rather than raising. The tools now delegate to them,
+  so there is one implementation.
+- **`SubAgentSpec` covers the whole serialisable config.** It mirrored 11 keys, so a
+  YAML-defined subagent could not set `max_retries`, any `retry_*` option,
+  `agent_kwargs`, `on_failure`, or `contain_errors` — the loader silently ignored
+  what it had no field for. It also validates now: `max_retries` cannot be negative,
+  `retry_backoff_multiplier` cannot shrink the delay, and `retry_max_delay` cannot
+  sit below `retry_initial_delay` (which pinned every retry to the cap instead of
+  backing off). `tests/test_spec.py` fails if the config gains a serialisable key
+  the spec cannot carry.
+
+### Removed
+
+- **`SubAgentDepsProtocol.subagents`.** The library never read it, so every
+  application carried a `dict` for nothing. Dropping a requirement only widens what
+  satisfies the protocol, so a deps class that still declares the field is
+  unaffected.
 
 ### Changed
 

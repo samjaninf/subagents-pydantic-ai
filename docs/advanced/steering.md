@@ -86,6 +86,39 @@ tool call and its return -- a shape most providers reject outright.
     send anything; use `ask_user` and [Questions](questions.md) instead. A task
     that has already finished returns an error naming its status.
 
+## Driving it from Python
+
+An application that orchestrates delegation itself — a UI, a supervisor loop, a
+team abstraction — does not have a model calling tools. `SubAgentToolset` exposes
+the same two operations directly:
+
+```python
+from subagents_pydantic_ai import create_subagent_toolset
+
+toolset = create_subagent_toolset()
+
+# While the task is running: fold a message into its next model request.
+delivered = await toolset.steer_task(task_id, "Narrow to packages/sparta/")
+
+# While the task is blocked in `ask_parent`: resolve the question.
+answered = toolset.answer_task(task_id, "Use PostgreSQL")
+```
+
+Both return a `bool` rather than raising, so a supervisor can pick whichever
+applies:
+
+```python
+if toolset.answer_task(task_id, message):
+    ...  # it was waiting for an answer
+elif await toolset.steer_task(task_id, message):
+    ...  # it is running, and will see the message next step
+else:
+    ...  # the task is over; read the outcome from its handle
+```
+
+Unlike the tools, neither performs run scoping — a caller holding a `task_id`
+already knows which task it owns.
+
 ## Isolation
 
 A steering message reaches a task only if the calling run started it:

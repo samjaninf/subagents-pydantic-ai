@@ -26,22 +26,16 @@ class SubAgentDepsProtocol(Protocol):
         @dataclass(slots=True)
         class MyDeps:
             backend: Backend
-            subagents: dict[str, Any] = field(default_factory=dict)
 
             def clone_for_subagent(self, max_depth: int = 0) -> "MyDeps":
-                return MyDeps(
-                    backend=self.backend,
-                    subagents={} if max_depth <= 0 else self.subagents,
-                )
+                return MyDeps(backend=self.backend)
         ```
 
-    Attributes:
-        subagents: Compiled agents the deps carries. This library never reads it;
-            it remains part of the protocol because existing applications declare
-            it and pydantic-deep uses it. New deps classes can leave it empty.
+    Earlier versions also required a `subagents: dict[str, Any]` attribute. The
+    library never read it, so every application carried a field for nothing; the
+    requirement is gone. A deps class that still declares it satisfies this
+    protocol unchanged.
     """
-
-    subagents: dict[str, Any]
 
     def clone_for_subagent(self, max_depth: int = 0) -> SubAgentDepsProtocol:
         """Create a new deps instance for a delegated subagent.

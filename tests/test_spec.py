@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 
-from subagents_pydantic_ai.spec import SubAgentSpec
+import pytest
+from pydantic import ValidationError
+
+from subagents_pydantic_ai.spec import UNSERIALISABLE_CONFIG_KEYS, SubAgentSpec
 from subagents_pydantic_ai.types import SubAgentConfig
 
 
@@ -332,3 +335,69 @@ class TestSubAgentSpecImport:
         import subagents_pydantic_ai
 
         assert "SubAgentSpec" in subagents_pydantic_ai.__all__
+
+
+class TestSpecTracksConfig:
+    """`SubAgentSpec` must mirror every serialisable `SubAgentConfig` key.
+
+    The spec used to cover 11 of the config's keys, so a YAML-defined subagent
+    could not set retries, `on_failure`, or `contain_errors` at all -- silently,
+    because the loader just ignored what it had no field for.
+    """
+
+    def test_every_serialisable_config_key_has_a_spec_field(self):
+        config_keys = set(SubAgentConfig.__annotations__)
+        spec_fields = set(SubAgentSpec.model_fields)
+        serialisable = config_keys - UNSERIALISABLE_CONFIG_KEYS
+
+        assert serialisable - spec_fields == set(), (
+            "SubAgentConfig gained serialisable keys that SubAgentSpec cannot carry. "
+            "Add the field to SubAgentSpec and to _OPTIONAL_FIELDS, or list the key "
+            "in UNSERIALISABLE_CONFIG_KEYS if it holds a live Python object."
+        )
+
+    def test_no_spec_field_is_missing_from_the_config(self):
+        assert set(SubAgentSpec.model_fields) - set(SubAgentConfig.__annotations__) == set()
+
+    def test_round_trip_preserves_every_serialisable_field(self):
+        spec = SubAgentSpec(
+            name="worker",
+            description="Does work",
+            instructions="Work hard.",
+            model="openai:gpt-4.1",
+            can_ask_questions=False,
+            max_questions=2,
+            preferred_mode="async",
+            typical_complexity="complex",
+            typically_needs_context=True,
+            context_files=["/AGENTS.md"],
+            agent_kwargs={"retries": 3},
+            max_retries=5,
+            retry_initial_delay=0.5,
+            retry_max_delay=10.0,
+            retry_backoff_multiplier=3.0,
+            retry_jitter=False,
+            on_failure="Summarise from what you have.",
+            contain_errors=False,
+            extra={"team": "core"},
+        )
+
+        assert SubAgentSpec.from_config(spec.to_config()) == spec
+
+    def test_unset_fields_are_absent_from_the_config(self):
+        config = SubAgentSpec(name="worker").to_config()
+
+        assert set(config) == {"name", "description", "instructions"}
+
+    def test_retry_bounds_are_validated(self):
+        with pytest.raises(ValidationError, match="retry_max_delay"):
+            SubAgentSpec(name="w", retry_initial_delay=10.0, retry_max_delay=1.0)
+
+    def test_negative_max_retries_is_rejected(self):
+        with pytest.raises(ValidationError):
+            SubAgentSpec(name="w", max_retries=-1)
+
+    def test_backoff_multiplier_below_one_is_rejected(self):
+        """A multiplier under 1 shrinks the delay each attempt, which is not backoff."""
+        with pytest.raises(ValidationError):
+            SubAgentSpec(name="w", retry_backoff_multiplier=0.5)
