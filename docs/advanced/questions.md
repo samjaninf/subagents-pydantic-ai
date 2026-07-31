@@ -60,9 +60,10 @@ Prevent infinite question loops with `max_questions`:
 ```python
 SubAgentConfig(
     name="analyst",
-    ...
+    description="Analyzes data",
+    instructions="You analyze data thoroughly.",
     can_ask_questions=True,
-    max_questions=3,  # After 3 questions, must complete without asking more
+    max_questions=3,  # After 3 questions, the subagent must finish on its own
 )
 ```
 

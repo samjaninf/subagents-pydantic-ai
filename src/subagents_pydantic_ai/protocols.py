@@ -17,37 +17,42 @@ if TYPE_CHECKING:
 class SubAgentDepsProtocol(Protocol):
     """Protocol for dependencies that support subagent management.
 
-    Any deps class that wants to use the subagent toolset must implement
-    this protocol. The key requirement is a `subagents` dict for storing
-    compiled agent instances and a `clone_for_subagent` method for creating
-    isolated deps for nested subagents.
+    The only method the library calls is `clone_for_subagent`, which decides what
+    a delegated subagent inherits from its parent. Your deps class may be frozen
+    or use `slots` -- the library never writes attributes onto it.
 
     Example:
         ```python
-        @dataclass
+        @dataclass(slots=True)
         class MyDeps:
-            subagents: dict[str, Any] = field(default_factory=dict)
+            backend: Backend
 
             def clone_for_subagent(self, max_depth: int = 0) -> "MyDeps":
-                return MyDeps(
-                    subagents={} if max_depth <= 0 else self.subagents,
-                )
+                return MyDeps(backend=self.backend)
         ```
+
+    Earlier versions also required a `subagents: dict[str, Any]` attribute. The
+    library never read it, so every application carried a field for nothing; the
+    requirement is gone. A deps class that still declares it satisfies this
+    protocol unchanged.
     """
 
-    subagents: dict[str, Any]
-
     def clone_for_subagent(self, max_depth: int = 0) -> SubAgentDepsProtocol:
-        """Create a new deps instance for a subagent.
+        """Create a new deps instance for a delegated subagent.
 
-        Subagents typically get:
-        - Shared resources (backend, files, etc.)
-        - Empty or limited subagents dict (based on max_depth)
-        - Fresh state for task-specific data
+        Return a **new** instance rather than `self`. The library relies on each
+        delegation getting its own deps, and a shared instance leaks state
+        between concurrent subagents.
+
+        A subagent typically inherits shared resources (a backend, a filesystem)
+        and gets fresh task-specific state.
 
         Args:
-            max_depth: Maximum nesting depth for the subagent.
-                If 0, the subagent cannot spawn further subagents.
+            max_depth: Remaining nesting budget, one less than the parent's
+                `max_nesting_depth`. At or below zero the subagent should not be
+                given the means to delegate further. Enforcement is yours: the
+                library passes the number through but does not itself refuse a
+                nested delegation.
 
         Returns:
             A new deps instance configured for the subagent.

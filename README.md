@@ -223,6 +223,7 @@ toolset = create_subagent_toolset(
 # delegate(
 #     description="Analyze this CSV and summarize trends",
 #     instructions="You are a data analyst. Return concise findings.",
+#     name="data-analyst",
 #     mode="sync",
 # )
 ```
@@ -249,12 +250,14 @@ The parent agent can then respond using `answer_subagent(task_id, answer)`.
 
 | Tool | Description |
 |------|-------------|
+| `task` | Delegate a task to a configured or registry-backed subagent |
 | `create_agent` | Create a reusable registry-backed specialist (opt-in modes) |
-| `task` | Delegate a task to a subagent (sync, async, or auto) |
-| `delegate` | Create and run an ephemeral specialist in one call |
-| `check_task` | Check status and get result of a background task |
+| `delegate` | Create and run an ephemeral specialist in one call (opt-in modes) |
+| `check_task` | Check status and get the full result of a background task |
+| `wait_tasks` | Wait for background tasks, in `all` or `any` mode |
+| `list_active_tasks` | List the running background tasks of this run |
 | `answer_subagent` | Answer a question from a blocked subagent |
-| `list_active_tasks` | List all running background tasks |
+| `send_message_to_subagent` | Steer a running background subagent |
 | `soft_cancel_task` | Request cooperative cancellation |
 | `hard_cancel_task` | Immediately cancel a task |
 
@@ -315,23 +318,29 @@ SubAgentConfig(
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     Parent Agent                        │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │              Subagent Toolset                   │    │
-│  │  task() │ check_task() │ answer_subagent()      │    │
-│  └─────────────────────────────────────────────────┘    │
-│                         │                               │
-│         ┌───────────────┼───────────────┐               │
-│         ▼               ▼               ▼               │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐         │
-│  │ researcher │  │   writer   │  │   coder    │         │
-│  │  (sync)    │  │  (async)   │  │  (auto)    │         │
-│  └────────────┘  └────────────┘  └────────────┘         │
-│                                                         │
-│              Message Bus (pluggable)                    │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                        Parent Agent                          │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │                    SubAgentToolset                     │  │
+│  │  task · delegate · check_task · wait_tasks · cancel…   │  │
+│  │                                                        │  │
+│  │  TaskManager   ChatTraceStore   DynamicAgentRegistry   │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                            │                                 │
+│         ┌──────────────────┼──────────────────┐              │
+│         ▼                  ▼                  ▼              │
+│  ┌────────────┐     ┌────────────┐     ┌────────────┐        │
+│  │ researcher │     │   writer   │     │   coder    │        │
+│  │   (sync)   │     │(background)│     │   (auto)   │        │
+│  └────────────┘     └────────────┘     └────────────┘        │
+│         │                  │                  │              │
+│         └──── TaskHandle: status · usage · cost · trace ──────┤
+└──────────────────────────────────────────────────────────────┘
 ```
+
+A background subagent stays reachable while it runs: the parent can steer it,
+answer its questions, and cancel it. `SubAgentCapability` cancels the run's
+background tasks when the run ends, so nothing outlives its parent.
 
 ## Vstorm OSS Ecosystem
 

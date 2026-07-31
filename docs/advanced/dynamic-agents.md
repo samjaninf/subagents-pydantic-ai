@@ -411,6 +411,7 @@ toolset = create_subagent_toolset(
 |-----------|------|-------------|
 | `description` | `str` | Task prompt for the specialist |
 | `instructions` | `str` | Specialist system prompt |
+| `name` | `str` | Label for logs and async task handles (letters, numbers, hyphens) |
 | `model` | `str \| None` | Optional model override |
 | `capabilities` | `list[str] \| None` | Optional capability names |
 | `can_ask_questions` | `bool` | Whether the specialist can ask the parent (default: `True`) |
@@ -422,8 +423,8 @@ One-shot specialists are **ephemeral**:
 
 - They are **not** registered in `DynamicAgentRegistry`
 - They do **not** count toward `max_agents`
-- They cannot be reused via `task(subagent_type=...)`
-- An internal name like `oneshot-{task_id}` is generated for logging and async task handles
+- They cannot be reused via `task(subagent_type=...)`, even though they have a `name`
+- `name` is a display label for logging and async task handles
 - They report **no chat trace**. A `Chat Trace ID` is only useful if `task` can
   resolve the subagent it belongs to, which is never true for a one-shot, so
   `delegate` results omit it and one-shot runs never occupy a slot in the
@@ -436,7 +437,7 @@ Use `delegate` for ad-hoc specialists. Use `create_agent` + `task` when you need
 
 Dynamic agents cannot override pre-configured agents:
 
-```python
+```text
 # If "researcher" is pre-configured:
 create_agent(name="researcher", ...)
 # Returns: "Error: Agent 'researcher' already exists"
@@ -448,7 +449,7 @@ create_agent(name="researcher", ...)
 
 Dynamic creation has overhead. Pre-configure common agents:
 
-```python
+```text
 # Good: Pre-configure known specialists
 subagents = [
     SubAgentConfig(name="researcher", ...),
@@ -463,7 +464,7 @@ subagents = [
 
 Use descriptive names for dynamic agents:
 
-```python
+```text
 # Good
 create_agent(name="react-typescript-expert", ...)
 

@@ -44,7 +44,7 @@ typecheck-mypy:
 	uv run mypy src/subagents_pydantic_ai tests
 
 .PHONY: typecheck
-typecheck: typecheck-pyright ## Run static type checking
+typecheck: typecheck-pyright ## Run static type checking (pyright, strict)
 
 .PHONY: typecheck-both
 typecheck-both: typecheck-pyright typecheck-mypy ## Run static type checking with both Pyright and Mypy

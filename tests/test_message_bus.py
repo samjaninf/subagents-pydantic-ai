@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -444,7 +444,7 @@ class TestTaskManager:
         await task  # Wait for completion
 
         # Simulate a run_task wrapper having recorded the real outcome.
-        completed_marker = datetime(2020, 1, 1)
+        completed_marker = datetime(2020, 1, 1, tzinfo=timezone.utc)
         handle.status = TaskStatus.COMPLETED
         handle.completed_at = completed_marker
 

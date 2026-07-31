@@ -126,3 +126,20 @@ agent = Agent(
     ],
 )
 ```
+
+## Programmatic access
+
+`answer_task` and `steer_task` are the Python halves of the `answer_subagent` and
+`send_message_to_subagent` tools, for an application that drives delegation itself.
+See [Steering](../advanced/steering.md#driving-it-from-python).
+
+::: subagents_pydantic_ai.SubAgentToolset
+    options:
+      show_root_heading: false
+      show_source: true
+      heading_level: 3
+      members:
+        - answer_task
+        - steer_task
+        - cancel_run_tasks
+        - get_total_usage

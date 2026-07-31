@@ -1,25 +1,39 @@
-"""Main subagent toolset with dual-mode execution support.
+"""The subagent toolset: delegate tasks to child agents, synchronously or in the background.
 
-This module provides the core toolset for delegating tasks to subagents.
-It supports both synchronous (blocking) and asynchronous (background)
-execution modes, with automatic mode selection based on task characteristics.
+`SubAgentToolset` is a `FunctionToolset` subclass that owns the delegation tools and
+the state behind them -- the task manager, the chat-trace store, and the dynamic
+agent registry. `create_subagent_toolset` builds one and is the entry point most
+applications use.
+
+The heavy lifting lives in sibling modules: `_execution` runs a delegation,
+`_observability` captures its telemetry, `_chat_trace` stores conversations a
+`chat_trace_id` can resume, and `_state` carries the channel `ask_parent` uses to
+reach the parent.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable
-from datetime import datetime
-from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic_ai import Agent, RunContext, UsageLimits
 from pydantic_ai.models import Model
-from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.toolsets import AbstractToolset, FunctionToolset
 
+from subagents_pydantic_ai._chat_trace import ChatTraceKey, ChatTraceStore
+from subagents_pydantic_ai._execution import DEFAULT_ASK_TIMEOUT_SECONDS, drain_steering_messages
+from subagents_pydantic_ai._execution import _run_async as _run_async
+from subagents_pydantic_ai._execution import _run_sync as _run_sync
+from subagents_pydantic_ai._observability import (
+    capture_message_history,
+    capture_result_observability,
+    model_responses,
+    result_traceparent,
+    serialize_output,
+)
+from subagents_pydantic_ai._state import current_subagent_state
 from subagents_pydantic_ai.dynamic_agent import (
     AgentFactory,
     CapabilityFactory,
@@ -38,11 +52,9 @@ from subagents_pydantic_ai.prompts import (
     SUBAGENT_SYSTEM_PROMPT,
     TASK_TOOL_DESCRIPTION,
     WAIT_TASKS_DESCRIPTION,
-    get_task_instructions_prompt,
 )
 from subagents_pydantic_ai.protocols import SubAgentDepsProtocol
 from subagents_pydantic_ai.registry import DynamicAgentRegistry
-from subagents_pydantic_ai.retry import RetryConfig, run_with_retry
 from subagents_pydantic_ai.types import (
     AgentMessage,
     AskUserCallback,
@@ -58,137 +70,34 @@ from subagents_pydantic_ai.types import (
     ToolsetFactory,
     UsageLimitsFactory,
     decide_execution_mode,
+    utcnow,
 )
 
-logger = logging.getLogger(__name__)
+# Aliases under the historical private names. The implementations moved into
+# `_execution` and `_observability`, but `_run_sync`, `_run_async`, and the capture
+# helpers are imported from this module by the test suite, and `_compile_subagent`
+# by pydantic-deep's team toolset.
+_capture_message_history = capture_message_history
+_capture_result_observability = capture_result_observability
+_drain_steering_messages = drain_steering_messages
+_get_result_traceparent = result_traceparent
+_iter_model_responses = model_responses
+_serialize_output = serialize_output
 
+_VALID_DELEGATION_CONFIGURATIONS = frozenset(
+    {"default", "persisted", "persisted_and_oneshot", "oneshot_only"}
+)
 
-def _serialize_output(output: Any) -> str:
-    """Serialize subagent output preserving structure for Pydantic models.
-
-    For Pydantic models (BaseModel), returns JSON via `model_dump_json()`.
-    For dataclasses with `__dataclass_fields__`, returns JSON via `json.dumps`.
-    For everything else, returns `str(output)`.
-    """
-    if hasattr(output, "model_dump_json"):
-        return output.model_dump_json()  # type: ignore[no-any-return]
-    if hasattr(output, "__dataclass_fields__"):
-        import dataclasses
-        import json
-
-        return json.dumps(dataclasses.asdict(output), default=str)
-    return str(output)
-
-
-def _capture_message_history(
-    result: Any,
-    on_message_history: Callable[[list[Any]], None] | None,
-) -> None:
-    """Capture a successful run's message history for a chat trace.
-
-    Best-effort, like `_capture_observability_best_effort`: a raising
-    `all_messages()` (or save callback) must never flip a successful run to
-    `FAILED`. On failure the previous saved history (if any) is kept, so a
-    continued trace resumes from the last successfully saved point.
-    """
-    if on_message_history is None:
-        return
-
-    try:
-        all_messages = getattr(result, "all_messages", None)
-        if all_messages is None:
-            return
-
-        messages: Any = all_messages()
-        if messages:
-            on_message_history(list(messages))
-    except Exception as e:
-        logger.warning("Failed to capture subagent message history: %s", e)
-
-
-def _get_result_traceparent(result: Any) -> str | None:
-    traceparent = getattr(result, "_traceparent", None)
-    if traceparent is None:
-        return None
-
-    value = traceparent(required=False)
-    return value if isinstance(value, str) and value else None
-
-
-def _iter_model_responses(result: Any) -> list[Any]:
-    responses: list[Any] = []
-    for message in result.all_messages():
-        if getattr(message, "kind", None) == "response":
-            responses.append(message)
-
-    try:
-        response = result.response
-    except (AttributeError, ValueError):
-        response = None
-    if response is not None and all(response is not item for item in responses):
-        responses.append(response)
-    return responses
-
-
-def _capture_result_observability(handle: TaskHandle, result: Any) -> None:
-    """Copy result observability onto a task handle."""
-    handle.usage = result.usage
-    handle.message_history = result.all_messages_json().decode()
-    handle.run_id = result.run_id
-    handle.conversation_id = result.conversation_id
-
-    handle.traceparent = _get_result_traceparent(result)
-    if handle.traceparent is not None:
-        parts = handle.traceparent.split("-")
-        if len(parts) >= 4:
-            handle.trace_id = parts[1]
-            handle.span_id = parts[2]
-
-    responses = _iter_model_responses(result)
-    if responses:
-        # Final response wins for per-run model/provider metadata: it is the
-        # model response that produced the returned output. In a multi-model
-        # run, earlier responses' model/provider metadata is not captured on
-        # the handle; aggregate fields such as `cost` and `tool_call_counts`
-        # are summed across all responses.
-        response = responses[-1]
-        handle.model_name = response.model_name
-        handle.provider_name = response.provider_name
-        handle.provider_url = response.provider_url
-        handle.provider_response_id = response.provider_response_id
-        handle.provider_details = response.provider_details
-        handle.finish_reason = response.finish_reason
-
-    total_cost = Decimal("0")
-    has_cost = False
-    tool_call_counts: dict[str, int] = {}
-    for response in responses:
-        if response.model_name:
-            try:
-                total_cost += response.cost().total_price
-                has_cost = True
-            except (AssertionError, LookupError):
-                pass
-
-        for tool_call in response.tool_calls:
-            tool_call_counts[tool_call.tool_name] = tool_call_counts.get(tool_call.tool_name, 0) + 1
-
-    handle.cost = total_cost if has_cost else None
-    handle.tool_call_counts = tool_call_counts
-
-
-def _capture_observability_best_effort(handle: TaskHandle, result: Any) -> None:
-    """Capture telemetry without ever failing the task.
-
-    Observability is best-effort (matching pydantic-ai's own instrumentation,
-    which warns on cost/serialization failures rather than propagating). A run
-    that succeeded must not be reported as ``FAILED`` just because a result
-    object lacks an attribute or telemetry collection raised.
-    """
-    try:
-        _capture_result_observability(handle, result)
-    except Exception as e:
-        logger.warning("Failed to capture subagent observability: %s", e)
+_DEFAULT_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "check_task": CHECK_TASK_DESCRIPTION,
+    "answer_subagent": ANSWER_SUBAGENT_DESCRIPTION,
+    "send_message_to_subagent": SEND_MESSAGE_TO_SUBAGENT_DESCRIPTION,
+    "list_active_tasks": LIST_ACTIVE_TASKS_DESCRIPTION,
+    "wait_tasks": WAIT_TASKS_DESCRIPTION,
+    "soft_cancel_task": SOFT_CANCEL_TASK_DESCRIPTION,
+    "hard_cancel_task": HARD_CANCEL_TASK_DESCRIPTION,
+}
+"""Model-facing description per background-task tool, overridable via `descriptions`."""
 
 
 def _format_chat_trace_result(output: str, chat_trace_id: str) -> str:
@@ -223,32 +132,17 @@ def _preview_result(result: str, task_id: str, max_chars: int | None) -> str:
     )
 
 
-async def _drain_steering_messages(message_bus: InMemoryMessageBus, agent_id: str) -> list[str]:
-    """Drain pending parent -> child steering messages for a running subagent.
+def _already_finished(task_id: str, handle: TaskHandle | None) -> str:
+    """Explain that a cancel arrived after the task was already over.
 
-    Pulls everything currently queued for ``agent_id`` and returns the text of
-    each ``TASK_UPDATE`` (the message type emitted by ``send_message_to_subagent``).
-    Other message types on the queue (e.g. an unused ``CANCEL_REQUEST`` — soft
-    cancel runs off the cancel event, not the bus) are ignored, as are empty
-    payloads.
-
-    Args:
-        message_bus: The bus the running subagent is registered on.
-        agent_id: The subagent's bus id (``subagent-{task_id}``).
-
-    Returns:
-        Steering instructions in delivery order (may be empty).
+    Reporting "not found" for a task whose result the orchestrator can still read
+    with `check_task` invites it to conclude the work was lost.
     """
-    pending = await message_bus.get_messages(agent_id, timeout=0)
-    steering: list[str] = []
-    for msg in pending:
-        if msg.type != MessageType.TASK_UPDATE:
-            continue
-        payload = msg.payload
-        text = payload.get("message") if isinstance(payload, dict) else payload
-        if text:
-            steering.append(str(text))
-    return steering
+    status = handle.status.value if handle is not None else "unknown"
+    return (
+        f"Task '{task_id}' is no longer running (status: {status}); nothing to cancel. "
+        f"Call check_task('{task_id}') for its outcome."
+    )
 
 
 def _create_general_purpose_config() -> SubAgentConfig:
@@ -279,43 +173,32 @@ def _compile_subagent(
     Returns:
         CompiledSubAgent with agent instance.
     """
-    # 1. Pre-built agent — use as-is
-    if config.get("agent") is not None:
+    prebuilt = config.get("agent")
+    if prebuilt is not None:
         return CompiledSubAgent(
             name=config["name"],
             description=config["description"],
-            agent=config["agent"],
+            agent=prebuilt,
             config=config,
         )
 
-    # 2. Agent factory — call it
     factory = config.get("agent_factory")
     if factory is not None:
-        custom_agent = factory(config)
         return CompiledSubAgent(
             name=config["name"],
             description=config["description"],
-            agent=custom_agent,
+            agent=factory(config),
             config=config,
         )
 
-    # 3. Default: create plain pydantic-ai Agent
-    model = config.get("model", default_model)
-
-    toolsets: list[Any] = []
-    ask_parent_toolset = _create_ask_parent_toolset()
-    toolsets.append(ask_parent_toolset)
-
-    if config.get("toolsets"):
-        toolsets.extend(config["toolsets"])
-
-    agent_kwargs = config.get("agent_kwargs", {})
+    toolsets: list[AbstractToolset[Any]] = [_create_ask_parent_toolset()]
+    toolsets.extend(config.get("toolsets") or [])
 
     agent: Agent[Any, str] = Agent(
-        model,
+        config.get("model", default_model),
         system_prompt=config["instructions"],
         toolsets=toolsets,
-        **agent_kwargs,
+        **config.get("agent_kwargs", {}),
     )
 
     return CompiledSubAgent(
@@ -327,7 +210,7 @@ def _compile_subagent(
 
 
 def _create_ask_parent_toolset() -> FunctionToolset[Any]:
-    """Create toolset with ask_parent tool for subagent communication."""
+    """Create a toolset with the `ask_parent` tool a subagent uses to reach its parent."""
     toolset: FunctionToolset[Any] = FunctionToolset(id="ask_parent")
 
     @toolset.tool
@@ -344,41 +227,41 @@ def _create_ask_parent_toolset() -> FunctionToolset[Any]:
         Returns:
             The parent's answer.
         """
-        # Try _subagent_state on deps (async mode)
-        state = getattr(ctx.deps, "_subagent_state", None)
-        if state is not None:
-            ask_callback = state.get("ask_callback")
-            if ask_callback:
-                result: str = await ask_callback(question)
-                return result
+        # The state bound for this delegation, or -- for a caller that injects it
+        # onto its own deps -- the legacy attribute. The library only ever binds
+        # the context variable; writing to the caller's deps object breaks a
+        # `frozen=True` or `slots=True` deps class.
+        state = current_subagent_state()
+        legacy = getattr(ctx.deps, "_subagent_state", None)
+        ask_callback = state.ask_callback if state is not None else None
+        task_manager = state.task_manager if state is not None else None
+        task_id = state.task_id if state is not None else None
+        timeout = state.ask_timeout_seconds if state is not None else DEFAULT_ASK_TIMEOUT_SECONDS
+        if isinstance(legacy, dict):
+            ask_callback = ask_callback or legacy.get("ask_callback")
+            task_manager = task_manager or legacy.get("task_manager")
+            task_id = task_id or legacy.get("task_id")
 
-            _task_manager = state.get("task_manager")
-            _task_id = state.get("task_id")
+        if ask_callback is not None:
+            return str(await ask_callback(question))
 
-            if _task_manager and _task_id:
-                handle = _task_manager.get_handle(_task_id)
-                if handle is not None:
-                    # Set question on handle so parent can see it via check_task
-                    handle.pending_question = question
-                    handle.status = TaskStatus.WAITING_FOR_ANSWER
+        if task_manager is not None and task_id is not None:
+            handle = task_manager.get_handle(task_id)
+            if handle is not None:
+                handle.pending_question = question
+                handle.status = TaskStatus.WAITING_FOR_ANSWER
 
-                    # Create a future and wait for answer_subagent to resolve it
-                    loop = asyncio.get_running_loop()
-                    answer_future: asyncio.Future[str] = loop.create_future()
-                    _task_manager.set_answer_future(_task_id, answer_future)
+                answer_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+                task_manager.set_answer_future(task_id, answer_future)
+                try:
+                    return await asyncio.wait_for(answer_future, timeout=timeout)
+                except asyncio.TimeoutError:
+                    return "Error: Parent did not respond in time"
+                finally:
+                    handle.status = TaskStatus.RUNNING
+                    handle.pending_question = None
+                    task_manager.clear_answer_future(task_id)
 
-                    try:
-                        answer = await asyncio.wait_for(answer_future, timeout=300.0)
-                        handle.status = TaskStatus.RUNNING
-                        handle.pending_question = None
-                        return answer
-                    except asyncio.TimeoutError:
-                        handle.status = TaskStatus.RUNNING
-                        handle.pending_question = None
-                        _task_manager.clear_answer_future(_task_id)
-                        return "Error: Parent did not respond in time"
-
-        # Fallback: use deps.ask_user callback (plan toolset compatibility)
         ask_user = getattr(ctx.deps, "ask_user", None)
         if ask_user:
             return str(await ask_user(question, []))
@@ -392,7 +275,904 @@ def _create_ask_parent_toolset() -> FunctionToolset[Any]:
     return toolset
 
 
-def create_subagent_toolset(  # noqa: C901
+class SubAgentToolset(FunctionToolset[Any]):
+    """Delegation tools plus the state that backs them.
+
+    Registers `task` (and, depending on `delegation_configuration`, `create_agent`
+    and `delegate`) alongside the background-task lifecycle tools `check_task`,
+    `answer_subagent`, `send_message_to_subagent`, `list_active_tasks`,
+    `wait_tasks`, `soft_cancel_task`, and `hard_cancel_task`.
+
+    `task_manager` and `get_total_usage()` are the supported observability surface;
+    they were previously attributes attached to a plain `FunctionToolset` after
+    construction.
+
+    Example:
+        ```python
+        from pydantic_ai import Agent
+        from subagents_pydantic_ai import SubAgentConfig, SubAgentToolset
+
+        toolset = SubAgentToolset(
+            subagents=[
+                SubAgentConfig(
+                    name="researcher",
+                    description="Researches topics",
+                    instructions="You are a research assistant.",
+                ),
+            ],
+        )
+        agent = Agent("openai:gpt-4.1", toolsets=[toolset])
+        ```
+    """
+
+    def __init__(
+        self,
+        subagents: list[SubAgentConfig] | None = None,
+        default_model: str | Model = "openai:gpt-4.1",
+        toolsets_factory: ToolsetFactory | None = None,
+        include_general_purpose: bool = True,
+        max_nesting_depth: int = 0,
+        id: str | None = None,
+        registry: DynamicAgentRegistry | None = None,
+        descriptions: dict[str, str] | None = None,
+        ask_user: AskUserCallback | None = None,
+        usage_limits: UsageLimits | UsageLimitsFactory | None = None,
+        delegation_configuration: DelegationConfiguration = "default",
+        allowed_models: list[str] | None = None,
+        capabilities_map: dict[str, CapabilityFactory] | None = None,
+        default_agent_factory: AgentFactory | None = None,
+        max_agents: int = 10,
+        max_chat_traces: int = 100,
+        max_task_handles: int = 500,
+        max_result_chars: int | None = 2000,
+        ask_timeout_seconds: float = DEFAULT_ASK_TIMEOUT_SECONDS,
+        contain_errors: bool = True,
+    ) -> None:
+        """Build the toolset. See `create_subagent_toolset` for the argument reference."""
+        super().__init__(id=id or "subagents")
+        self._validate(
+            delegation_configuration=delegation_configuration,
+            subagents=subagents,
+            registry=registry,
+            allowed_models=allowed_models,
+            capabilities_map=capabilities_map,
+            default_agent_factory=default_agent_factory,
+            max_result_chars=max_result_chars,
+            ask_timeout_seconds=ask_timeout_seconds,
+        )
+
+        self._descriptions = descriptions or {}
+        self._default_model = default_model
+        self._toolsets_factory = toolsets_factory
+        self._max_nesting_depth = max_nesting_depth
+        self._ask_user = ask_user
+        self._usage_limits = usage_limits
+        self._allowed_models = allowed_models
+        self._capabilities_map = capabilities_map
+        self._default_agent_factory = default_agent_factory
+        self._max_task_handles = max_task_handles
+        self._max_result_chars = max_result_chars
+        self._ask_timeout_seconds = ask_timeout_seconds
+        self._contain_errors = contain_errors
+
+        self.registry = (
+            registry if registry is not None else DynamicAgentRegistry(max_agents=max_agents)
+        )
+        self.task_manager = TaskManager(message_bus=InMemoryMessageBus())
+        self._chat_traces = ChatTraceStore(max_traces=max_chat_traces)
+        # Usage from evicted handles, so `get_total_usage` survives eviction.
+        self._evicted_usage = {"input_tokens": 0, "output_tokens": 0, "requests": 0}
+
+        configs: list[SubAgentConfig] = list(subagents) if subagents else []
+        if include_general_purpose and self._expose_task:
+            configs.append(_create_general_purpose_config())
+        self._compiled: dict[str, CompiledSubAgent] = {
+            config["name"]: _compile_subagent(config, default_model) for config in configs
+        }
+
+        self._register_tools()
+
+    # -- construction ----------------------------------------------------------
+
+    def _validate(
+        self,
+        *,
+        delegation_configuration: DelegationConfiguration,
+        subagents: list[SubAgentConfig] | None,
+        registry: DynamicAgentRegistry | None,
+        allowed_models: list[str] | None,
+        capabilities_map: dict[str, CapabilityFactory] | None,
+        default_agent_factory: AgentFactory | None,
+        max_result_chars: int | None,
+        ask_timeout_seconds: float,
+    ) -> None:
+        """Reject a configuration that contradicts itself.
+
+        Hiding a tool also hides everything only that tool reads, so configuration
+        for a hidden tool can never take effect. Raising here surfaces the
+        contradiction where the caller can still see their own arguments; dropping
+        it silently only shows up later as a subagent that ignores an allow-list,
+        or a capability the model is never offered.
+        """
+        if delegation_configuration not in _VALID_DELEGATION_CONFIGURATIONS:
+            valid = ", ".join(sorted(_VALID_DELEGATION_CONFIGURATIONS))
+            raise ValueError(
+                f"Invalid delegation_configuration '{delegation_configuration}'. "
+                f"Expected one of: {valid}"
+            )
+
+        self._delegation_configuration = delegation_configuration
+
+        if not self._expose_task:
+            if subagents:
+                raise ValueError(
+                    f"delegation_configuration={delegation_configuration!r} cannot be combined "
+                    "with non-empty subagents; configured subagents would be unreachable "
+                    "without the task tool. Omit subagents, or use a mode that exposes task."
+                )
+            if registry is not None:
+                raise ValueError(
+                    f"delegation_configuration={delegation_configuration!r} cannot be combined "
+                    "with a registry; registry-backed agents are only reachable through the "
+                    "task tool. Omit registry, or use a mode that exposes task."
+                )
+
+        if not self._expose_create_agent and not self._expose_delegate:
+            unreachable = [
+                name
+                for name, value in (
+                    ("allowed_models", allowed_models),
+                    ("capabilities_map", capabilities_map),
+                    ("default_agent_factory", default_agent_factory),
+                )
+                if value is not None
+            ]
+            if unreachable:
+                raise ValueError(
+                    f"delegation_configuration={delegation_configuration!r} exposes no "
+                    f"dynamic-agent tool, so {', '.join(unreachable)} would be ignored. "
+                    "Use 'persisted', 'persisted_and_oneshot', or 'oneshot_only'."
+                )
+
+        if max_result_chars is not None and max_result_chars < 0:
+            raise ValueError(f"max_result_chars must be >= 0 or None, got {max_result_chars}")
+
+        if ask_timeout_seconds <= 0:
+            raise ValueError(f"ask_timeout_seconds must be > 0, got {ask_timeout_seconds}")
+
+    @property
+    def _expose_create_agent(self) -> bool:
+        return self._delegation_configuration in {"persisted", "persisted_and_oneshot"}
+
+    @property
+    def _expose_task(self) -> bool:
+        return self._delegation_configuration != "oneshot_only"
+
+    @property
+    def _expose_delegate(self) -> bool:
+        return self._delegation_configuration in {"persisted_and_oneshot", "oneshot_only"}
+
+    def _register_tools(self) -> None:
+        models_desc = (
+            f"Allowed models: {', '.join(self._allowed_models)}"
+            if self._allowed_models
+            else "Any model is allowed"
+        )
+        caps_desc = (
+            f"Available capabilities: {', '.join(self._capabilities_map.keys())}"
+            if self._capabilities_map
+            else "No predefined capabilities available"
+        )
+        dynamic_agent_desc = (
+            f"{models_desc}\n{caps_desc}\n\n"
+            f"Default model when none is given: {self._default_model}."
+        )
+
+        if self._expose_create_agent:
+            self.add_function(
+                self.create_agent,
+                description=self._descriptions.get(
+                    "create_agent",
+                    "Create a reusable specialized agent at runtime. The agent is stored "
+                    "in the registry and can be used repeatedly with the task tool.\n\n"
+                    f"{dynamic_agent_desc}",
+                ),
+            )
+
+        if self._expose_task:
+            subagent_list = "\n".join(
+                f"- {name}: {compiled.description}" for name, compiled in self._compiled.items()
+            )
+            self.add_function(
+                self.task,
+                description=self._descriptions.get(
+                    "task",
+                    TASK_TOOL_DESCRIPTION.rstrip()
+                    + f"\n\nAvailable subagent types:\n{subagent_list}",
+                ),
+            )
+
+        if self._expose_delegate:
+            self.add_function(
+                self.delegate,
+                description=self._descriptions.get(
+                    "delegate",
+                    DELEGATE_TOOL_DESCRIPTION.rstrip() + f"\n\n{dynamic_agent_desc}",
+                ),
+            )
+
+        self.add_function(self.check_task, description=self._describe("check_task"))
+        self.add_function(self.answer_subagent, description=self._describe("answer_subagent"))
+        self.add_function(
+            self.send_message_to_subagent,
+            description=self._describe("send_message_to_subagent"),
+        )
+        self.add_function(self.list_active_tasks, description=self._describe("list_active_tasks"))
+        self.add_function(self.wait_tasks, description=self._describe("wait_tasks"))
+        self.add_function(self.soft_cancel_task, description=self._describe("soft_cancel_task"))
+        self.add_function(self.hard_cancel_task, description=self._describe("hard_cancel_task"))
+
+    def _describe(self, tool_name: str) -> str:
+        """The caller's description override for a tool, or the built-in default."""
+        return self._descriptions.get(tool_name, _DEFAULT_TOOL_DESCRIPTIONS[tool_name])
+
+    # -- observability surface -------------------------------------------------
+
+    @property
+    def message_history_store(self) -> OrderedDict[ChatTraceKey, list[Any]]:
+        """Stored chat-trace histories, keyed by `(subagent_name, chat_trace_id)`."""
+        return self._chat_traces.history
+
+    def get_total_usage(self) -> dict[str, int]:
+        """Aggregate token usage across every subagent task this toolset has run.
+
+        Usage from evicted handles is folded in, so the totals do not shrink when
+        `max_task_handles` evicts old tasks.
+
+        Returns:
+            `input_tokens`, `output_tokens`, `total_tokens`, and `requests`.
+        """
+        totals = {
+            "input_tokens": self._evicted_usage["input_tokens"],
+            "output_tokens": self._evicted_usage["output_tokens"],
+            "total_tokens": 0,
+            "requests": self._evicted_usage["requests"],
+        }
+        for handle in self.task_manager.list_handles():
+            if handle.usage is not None:
+                totals["input_tokens"] += getattr(handle.usage, "input_tokens", 0)
+                totals["output_tokens"] += getattr(handle.usage, "output_tokens", 0)
+                totals["requests"] += getattr(handle.usage, "requests", 0)
+        totals["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
+        return totals
+
+    def _evict_finished_handles(self) -> None:
+        """Drop the oldest finished handles past `max_task_handles`.
+
+        Running and waiting tasks are never evicted. Evicted usage is accumulated
+        so `get_total_usage` stays correct.
+        """
+        finished = [h for h in self.task_manager.handles.values() if h.is_finished]
+        overflow = len(finished) - self._max_task_handles
+        if overflow <= 0:
+            return
+        finished.sort(key=lambda h: h.completed_at or h.created_at)
+        for old in finished[:overflow]:
+            if old.usage is not None:
+                self._evicted_usage["input_tokens"] += getattr(old.usage, "input_tokens", 0)
+                self._evicted_usage["output_tokens"] += getattr(old.usage, "output_tokens", 0)
+                self._evicted_usage["requests"] += getattr(old.usage, "requests", 0)
+            self.task_manager.handles.pop(old.task_id, None)
+
+    def _handle_for(self, ctx: RunContext[SubAgentDepsProtocol], task_id: str) -> TaskHandle | None:
+        """The handle for `task_id`, if this run is allowed to see it.
+
+        One toolset instance is typically built per agent and shared by every run
+        that agent serves, so an unfiltered lookup would let one run inspect,
+        answer, or cancel another run's task. Handles created without a
+        `parent_run_id` (constructed directly, or by an older caller) stay visible
+        to everyone.
+        """
+        handle = self.task_manager.get_handle(task_id)
+        if handle is None:
+            return None
+        if handle.parent_run_id is not None and handle.parent_run_id != ctx.run_id:
+            return None
+        return handle
+
+    async def cancel_run_tasks(self, run_id: str | None) -> None:
+        """Cancel every background task started by `run_id` and await its cleanup."""
+        await self.task_manager.cancel_all(run_id)
+
+    def answer_task(self, task_id: str, answer: str) -> bool:
+        """Answer a background task blocked in `ask_parent`, from Python.
+
+        The programmatic half of the `answer_subagent` tool, for an application
+        that drives delegation itself rather than letting a model call the tools.
+        Unlike the tool, it performs no run scoping: the caller already knows which
+        task it owns.
+
+        Args:
+            task_id: The task waiting for an answer.
+            answer: The answer to deliver.
+
+        Returns:
+            Whether a waiting `ask_parent` call was resolved. `False` means the
+            task was not waiting -- it may have finished, or never asked.
+        """
+        return self.task_manager.resolve_answer(task_id, answer)
+
+    async def steer_task(self, task_id: str, message: str) -> bool:
+        """Steer a running background task, from Python.
+
+        The programmatic half of the `send_message_to_subagent` tool. The message
+        is folded into the subagent's next model request, so it adapts without
+        losing partial progress.
+
+        Args:
+            task_id: The running task to steer.
+            message: The steering instruction.
+
+        Returns:
+            Whether the message was queued. `False` means the task is not running,
+            so there is no next model request to deliver into.
+        """
+        agent_id = f"subagent-{task_id}"
+        if not self.task_manager.message_bus.is_registered(agent_id):
+            return False
+        await self.task_manager.message_bus.send(
+            AgentMessage(
+                type=MessageType.TASK_UPDATE,
+                sender="parent",
+                receiver=agent_id,
+                payload={"message": message},
+                task_id=task_id,
+            )
+        )
+        return True
+
+    # -- delegation ------------------------------------------------------------
+
+    async def _execute(
+        self,
+        ctx: RunContext[SubAgentDepsProtocol],
+        subagent: CompiledSubAgent,
+        description: str,
+        *,
+        mode: ExecutionMode,
+        priority: TaskPriority,
+        complexity: Literal["simple", "moderate", "complex"] | None,
+        requires_user_context: bool,
+        may_need_clarification: bool,
+        inject_ask_parent: bool = False,
+        task_id: str | None = None,
+        chat_trace_id: str | None = None,
+        persist_chat_trace: bool = True,
+    ) -> str:
+        """Run a compiled subagent with chat-trace and observability support.
+
+        `persist_chat_trace` must be `False` for a subagent the orchestrator cannot
+        address by name later -- a one-shot specialist. A chat trace is only worth
+        handing out if `task` can resolve the subagent it belongs to, and storing
+        one costs a slot in the chat-trace LRU that a continuable conversation
+        would otherwise keep.
+        """
+        config = subagent.config
+        agent = subagent.agent
+        if agent is None:
+            return f"Error: Subagent '{subagent.name}' is not properly initialized"
+
+        resolved_usage_limits = (
+            self._usage_limits(ctx, config) if callable(self._usage_limits) else self._usage_limits
+        )
+
+        subagent_deps = ctx.deps.clone_for_subagent(self._max_nesting_depth - 1)
+
+        runtime_toolsets: list[AbstractToolset[Any]] | None = None
+        if self._toolsets_factory or inject_ask_parent:
+            runtime_toolsets = []
+            if inject_ask_parent and config.get("can_ask_questions", True):
+                runtime_toolsets.append(_create_ask_parent_toolset())
+            if self._toolsets_factory:
+                runtime_toolsets.extend(self._toolsets_factory(subagent_deps))
+
+        actual_task_id = task_id or uuid.uuid4().hex[:8]
+        effective_chat_trace_id = chat_trace_id or uuid.uuid4().hex
+        trace_key: ChatTraceKey = (config["name"], effective_chat_trace_id)
+
+        if self._chat_traces.is_active(trace_key):
+            return (
+                f"Error: chat trace '{effective_chat_trace_id}' already has a running "
+                f"task on subagent '{config['name']}'. Wait for it to finish "
+                f"(check_task/wait_tasks) before continuing this conversation."
+            )
+        message_history = self._chat_traces.history_for(trace_key)
+        if message_history is None and chat_trace_id is not None:
+            return (
+                f"Error: no saved conversation for chat_trace_id '{chat_trace_id}' "
+                f"with subagent '{config['name']}' (unknown, evicted, or its first "
+                f"run failed). Omit chat_trace_id to start a new conversation."
+            )
+
+        def save_message_history(messages: list[Any]) -> None:
+            self._chat_traces.save(trace_key, messages)
+
+        # A one-shot run exposes no chat trace, so it neither stores history nor
+        # reports an id: `handle.chat_trace_id` stays `None` and check_task /
+        # wait_tasks skip it for the same reason the returned text does.
+        on_history = save_message_history if persist_chat_trace else None
+        reported_chat_trace_id = effective_chat_trace_id if persist_chat_trace else None
+
+        self._evict_finished_handles()
+
+        if mode == "auto":
+            characteristics = TaskCharacteristics(
+                estimated_complexity=complexity or config.get("typical_complexity", "moderate"),
+                requires_user_context=requires_user_context
+                or config.get("typically_needs_context", False),
+                may_need_clarification=may_need_clarification,
+            )
+            resolved_mode = decide_execution_mode(characteristics, config)
+        else:
+            resolved_mode = mode
+
+        if resolved_mode == "sync":
+            handle = TaskHandle(
+                task_id=actual_task_id,
+                subagent_name=config["name"],
+                description=description,
+                status=TaskStatus.RUNNING,
+                priority=priority,
+                chat_trace_id=reported_chat_trace_id,
+                started_at=utcnow(),
+                parent_run_id=ctx.run_id,
+            )
+            self.task_manager.handles[actual_task_id] = handle
+            self._chat_traces.mark_active(trace_key)
+            try:
+                result = await _run_sync(
+                    agent=agent,
+                    config=config,
+                    description=description,
+                    deps=subagent_deps,
+                    task_id=actual_task_id,
+                    extra_toolsets=runtime_toolsets,
+                    ask_user=self._ask_user,
+                    usage_limits=resolved_usage_limits,
+                    handle=handle,
+                    message_history=message_history,
+                    on_message_history=on_history,
+                    ask_timeout_seconds=self._ask_timeout_seconds,
+                    contain_errors=config.get("contain_errors", self._contain_errors),
+                )
+            finally:
+                self._chat_traces.release(trace_key)
+            # Don't advertise continuation when the run failed and nothing was ever
+            # saved for this trace -- the chat_trace_id would resume nothing.
+            if persist_chat_trace and (
+                handle.status != TaskStatus.FAILED or trace_key in self._chat_traces
+            ):
+                return _format_chat_trace_result(result, effective_chat_trace_id)
+            return result
+
+        self._chat_traces.mark_active(trace_key)
+        try:
+            return await _run_async(
+                agent=agent,
+                config=config,
+                description=description,
+                deps=subagent_deps,
+                task_id=actual_task_id,
+                task_manager=self.task_manager,
+                message_bus=self.task_manager.message_bus,
+                extra_toolsets=runtime_toolsets,
+                priority=priority,
+                usage_limits=resolved_usage_limits,
+                chat_trace_id=reported_chat_trace_id,
+                message_history=message_history,
+                on_message_history=on_history,
+                on_run_finished=lambda: self._chat_traces.release(trace_key),
+                ask_timeout_seconds=self._ask_timeout_seconds,
+                parent_run_id=ctx.run_id,
+            )
+        except BaseException:
+            # `_run_async` failed before the background task took ownership.
+            self._chat_traces.release(trace_key)
+            raise
+
+    # -- tools -----------------------------------------------------------------
+
+    async def create_agent(
+        self,
+        ctx: RunContext[SubAgentDepsProtocol],
+        name: str,
+        description: str,
+        instructions: str,
+        model: str | None = None,
+        capabilities: list[str] | None = None,
+        can_ask_questions: bool = True,
+    ) -> str:
+        """Create and register a reusable specialized agent.
+
+        Args:
+            ctx: The run context.
+            name: Unique name for the agent (letters, numbers, hyphens only).
+            description: Brief description of what the agent does.
+            instructions: System prompt for the agent.
+            model: Model to use. Defaults to the toolset's default model.
+            capabilities: Capability names to enable for the agent.
+            can_ask_questions: Whether the agent can ask the parent questions.
+        """
+        if self.registry.exists(name):
+            return f"Error: Agent '{name}' already exists"
+
+        actual_model = model or self._default_model
+        result = build_dynamic_agent(
+            ctx,
+            name=name,
+            description=description,
+            instructions=instructions,
+            model=actual_model,
+            can_ask_questions=can_ask_questions,
+            capabilities=capabilities,
+            allowed_models=self._allowed_models,
+            toolsets_factory=None,
+            capabilities_map=self._capabilities_map,
+            default_agent_factory=self._default_agent_factory,
+        )
+        if isinstance(result, str):
+            return result
+        agent, config = result
+
+        try:
+            self.registry.register(config, agent)
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+        caps_info = f"\nCapabilities: {', '.join(capabilities)}" if capabilities else ""
+        return (
+            f"Agent '{name}' created successfully.\n"
+            f"Model: {actual_model}\n"
+            f"Description: {description}{caps_info}\n"
+            f"Use task(description, '{name}') to delegate tasks."
+        )
+
+    async def task(
+        self,
+        ctx: RunContext[SubAgentDepsProtocol],
+        description: str,
+        subagent_type: str,
+        mode: ExecutionMode = "sync",
+        priority: TaskPriority = TaskPriority.NORMAL,
+        complexity: Literal["simple", "moderate", "complex"] | None = None,
+        requires_user_context: bool = False,
+        may_need_clarification: bool = False,
+        chat_trace_id: str | None = None,
+    ) -> str:
+        """Delegate a task to a specialized subagent.
+
+        Args:
+            ctx: The run context with dependencies.
+            description: Detailed description of the task to perform.
+            subagent_type: Name of the subagent to use.
+            mode: Execution mode - "sync" (blocking), "async" (background), or "auto".
+            priority: Task priority level (for async tasks).
+            complexity: Override complexity estimate ("simple", "moderate", "complex").
+            requires_user_context: Whether task needs ongoing user interaction.
+            may_need_clarification: Whether task might need clarifying questions.
+            chat_trace_id: Optional explicit chat trace ID. When omitted, a new subagent
+                conversation is created. When provided, this subagent resumes from
+                the previous successful task with the same chat trace.
+        """
+        if subagent_type in self._compiled:
+            subagent = self._compiled[subagent_type]
+            inject_ask_parent = False
+        elif (registry_subagent := self.registry.get_compiled(subagent_type)) is not None:
+            subagent = registry_subagent
+            inject_ask_parent = True
+        else:
+            available = ", ".join([*self._compiled, *self.registry.list_agents()])
+            return f"Error: Unknown subagent '{subagent_type}'. Available: {available}"
+
+        return await self._execute(
+            ctx,
+            subagent,
+            description,
+            mode=mode,
+            priority=priority,
+            complexity=complexity,
+            requires_user_context=requires_user_context,
+            may_need_clarification=may_need_clarification,
+            inject_ask_parent=inject_ask_parent,
+            chat_trace_id=chat_trace_id,
+        )
+
+    async def delegate(
+        self,
+        ctx: RunContext[SubAgentDepsProtocol],
+        description: str,
+        instructions: str,
+        name: str,
+        model: str | None = None,
+        capabilities: list[str] | None = None,
+        can_ask_questions: bool = True,
+        mode: ExecutionMode = "sync",
+        priority: TaskPriority = TaskPriority.NORMAL,
+        complexity: Literal["simple", "moderate", "complex"] | None = None,
+        requires_user_context: bool = False,
+        may_need_clarification: bool = False,
+    ) -> str:
+        """Create an ephemeral specialist and delegate a task to it in one call.
+
+        Args:
+            ctx: The run context.
+            description: The task for the specialist to execute.
+            instructions: The specialist's system prompt.
+            name: Label for the specialist (letters, numbers, hyphens), used in
+                logs and as `TaskHandle.subagent_name`. Naming it does not
+                register it: it still cannot be reused via `task`.
+            model: Model to use. Defaults to the toolset's default model.
+            capabilities: Capability names to attach to the specialist.
+            can_ask_questions: Whether the specialist can ask the parent questions.
+            mode: Execution mode - "sync" (blocking), "async" (background), or "auto".
+            priority: Task priority level (for async tasks).
+            complexity: Override complexity estimate.
+            requires_user_context: Whether task needs ongoing user interaction.
+            may_need_clarification: Whether task might need clarifying questions.
+        """
+        task_id = uuid.uuid4().hex[:8]
+        agent_description = description[:120] or "Ephemeral specialist"
+
+        result = build_dynamic_agent(
+            ctx,
+            name=name,
+            description=agent_description,
+            instructions=instructions,
+            model=model or self._default_model,
+            can_ask_questions=can_ask_questions,
+            capabilities=capabilities,
+            allowed_models=self._allowed_models,
+            toolsets_factory=None,
+            capabilities_map=self._capabilities_map,
+            default_agent_factory=self._default_agent_factory,
+        )
+        if isinstance(result, str):
+            return result
+        agent, config = result
+
+        return await self._execute(
+            ctx,
+            CompiledSubAgent(
+                name=name,
+                description=agent_description,
+                agent=agent,
+                config=config,
+            ),
+            description,
+            mode=mode,
+            priority=priority,
+            complexity=complexity,
+            requires_user_context=requires_user_context,
+            may_need_clarification=may_need_clarification,
+            inject_ask_parent=True,
+            task_id=task_id,
+            persist_chat_trace=False,
+        )
+
+    async def check_task(
+        self,
+        ctx: RunContext[SubAgentDepsProtocol],
+        task_id: str,
+    ) -> str:
+        """Check the status of a background task.
+
+        Args:
+            ctx: The run context.
+            task_id: The task ID returned when the task was started.
+        """
+        handle = self._handle_for(ctx, task_id)
+        if handle is None:
+            return f"Error: Task '{task_id}' not found"
+
+        status_info = [
+            f"Task: {task_id}",
+            f"Subagent: {handle.subagent_name}",
+            f"Status: {handle.status}",
+            f"Description: {handle.description}",
+        ]
+        # Only advertise continuation for completed tasks -- a failed or still
+        # running task has not saved this run's history yet (matches wait_tasks).
+        if handle.chat_trace_id is not None and handle.status == TaskStatus.COMPLETED:
+            status_info.append(f"Chat Trace ID: {handle.chat_trace_id}")
+
+        if handle.status == TaskStatus.COMPLETED:
+            status_info.append(f"Result: {handle.result}")
+        elif handle.status == TaskStatus.FAILED:
+            status_info.append(f"Error: {handle.error}")
+        elif handle.status == TaskStatus.WAITING_FOR_ANSWER:
+            status_info.append(f"Question: {handle.pending_question}")
+        elif handle.started_at:
+            elapsed = (utcnow() - handle.started_at).total_seconds()
+            status_info.append(f"Running for: {elapsed:.1f}s")
+
+        return "\n".join(status_info)
+
+    async def answer_subagent(
+        self,
+        ctx: RunContext[SubAgentDepsProtocol],
+        task_id: str,
+        answer: str,
+    ) -> str:
+        """Answer a question from a subagent.
+
+        Args:
+            ctx: The run context.
+            task_id: The task ID of the waiting subagent.
+            answer: Your answer to the subagent's question.
+        """
+        handle = self._handle_for(ctx, task_id)
+        if handle is None:
+            return f"Error: Task '{task_id}' not found"
+
+        if handle.status != TaskStatus.WAITING_FOR_ANSWER:
+            return f"Error: Task '{task_id}' is not waiting for an answer (status: {handle.status})"
+
+        if self.answer_task(task_id, answer):
+            return f"Answer sent to task '{task_id}'"
+
+        return "Error: Could not send answer - subagent is no longer waiting"
+
+    async def send_message_to_subagent(
+        self,
+        ctx: RunContext[SubAgentDepsProtocol],
+        task_id: str,
+        message: str,
+    ) -> str:
+        """Steer a running async subagent with an unprompted message.
+
+        The message is queued for the subagent and folded into its next model
+        request as an extra user instruction, so it adapts without losing
+        partial progress. Works only while the task is still running.
+
+        Args:
+            ctx: The run context.
+            task_id: The task ID of the running async subagent.
+            message: The steering instruction to deliver.
+        """
+        handle = self._handle_for(ctx, task_id)
+        if handle is None:
+            return f"Error: Task '{task_id}' not found"
+
+        if not await self.steer_task(task_id, message):
+            return (
+                f"Error: Task '{task_id}' is not accepting messages "
+                f"(status: {handle.status}). Steering only works for running "
+                "async tasks."
+            )
+
+        return (
+            f"Message delivered to task '{task_id}'; "
+            "it will be applied on the subagent's next step."
+        )
+
+    async def list_active_tasks(self, ctx: RunContext[SubAgentDepsProtocol]) -> str:
+        """List all active background tasks."""
+        lines = ["Active background tasks:"]
+        for tid in self.task_manager.list_active_tasks():
+            handle = self._handle_for(ctx, tid)
+            if handle is None:
+                continue
+            desc = handle.description[:50]
+            lines.append(f"- {tid}: {handle.subagent_name} ({handle.status}) - {desc}...")
+
+        if len(lines) == 1:
+            return "No active background tasks."
+        return "\n".join(lines)
+
+    async def wait_tasks(
+        self,
+        ctx: RunContext[SubAgentDepsProtocol],
+        task_ids: list[str],
+        timeout: float = 300.0,
+        mode: Literal["all", "any"] = "all",
+    ) -> str:
+        """Wait for multiple background tasks to complete.
+
+        Args:
+            ctx: The run context.
+            task_ids: List of task IDs to wait for.
+            timeout: Maximum seconds to wait (default 300s / 5 minutes).
+            mode: `"all"` (default) waits for every task to finish.
+                `"any"` returns as soon as one task reaches a terminal
+                state (completed, failed, or cancelled), so the orchestrator
+                can react to the first finisher without stalling on the
+                slowest one.
+        """
+        pending = [
+            task
+            for tid in task_ids
+            if (task := self.task_manager.tasks.get(tid)) is not None and not task.done()
+        ]
+        if pending:
+            # Both modes route through `asyncio.wait`. Unlike
+            # `asyncio.wait_for(asyncio.gather(...))`, `asyncio.wait` does *not*
+            # cascade cancellation to its constituent tasks -- neither on timeout
+            # nor when its caller is cancelled (e.g. pydantic-ai's `_call_tools`
+            # sibling-cancel hitting this tool call). Workers keep owning their
+            # lifecycle, which is what an orchestrator expects.
+            return_when = asyncio.FIRST_COMPLETED if mode == "any" else asyncio.ALL_COMPLETED
+            await asyncio.wait(pending, timeout=timeout, return_when=return_when)
+
+        lines: list[str] = []
+        finished_count = 0
+        for tid in task_ids:
+            handle = self._handle_for(ctx, tid)
+            if handle is None:
+                lines.append(f"- {tid}: not found")
+                continue
+            if handle.status == TaskStatus.COMPLETED:
+                finished_count += 1
+                preview = _preview_result(handle.result or "", tid, self._max_result_chars)
+                trace_line = (
+                    f"Chat Trace ID: {handle.chat_trace_id}\n"
+                    if handle.chat_trace_id is not None
+                    else ""
+                )
+                lines.append(f"- {tid} ({handle.subagent_name}): COMPLETED\n{trace_line}{preview}")
+            elif handle.is_finished:
+                finished_count += 1
+                lines.append(
+                    f"- {tid} ({handle.subagent_name}): "
+                    f"{handle.status.value.upper()} - {handle.error}"
+                )
+            else:
+                lines.append(f"- {tid} ({handle.subagent_name}): {handle.status}")
+
+        total = len(task_ids)
+        header_parts = [f"mode={mode}", f"{finished_count}/{total} finished"]
+        if total - finished_count > 0:
+            header_parts.append(f"{total - finished_count} still running")
+
+        return f"Task results ({', '.join(header_parts)}):\n" + "\n\n".join(lines)
+
+    async def soft_cancel_task(
+        self,
+        ctx: RunContext[SubAgentDepsProtocol],
+        task_id: str,
+    ) -> str:
+        """Request cooperative cancellation of a background task.
+
+        Args:
+            ctx: The run context.
+            task_id: The task to cancel.
+        """
+        handle = self._handle_for(ctx, task_id)
+        if handle is None and task_id not in self.task_manager.tasks:
+            return f"Error: Task '{task_id}' not found"
+        if await self.task_manager.soft_cancel(task_id):
+            return f"Cancellation requested for task '{task_id}'"
+        return _already_finished(task_id, handle)
+
+    async def hard_cancel_task(
+        self,
+        ctx: RunContext[SubAgentDepsProtocol],
+        task_id: str,
+    ) -> str:
+        """Immediately cancel a background task.
+
+        Args:
+            ctx: The run context.
+            task_id: The task to cancel.
+        """
+        handle = self._handle_for(ctx, task_id)
+        if handle is None and task_id not in self.task_manager.tasks:
+            return f"Error: Task '{task_id}' not found"
+        if await self.task_manager.hard_cancel(task_id):
+            return f"Task '{task_id}' has been cancelled"
+        return _already_finished(task_id, handle)
+
+
+def create_subagent_toolset(
     subagents: list[SubAgentConfig] | None = None,
     default_model: str | Model = "openai:gpt-4.1",
     toolsets_factory: ToolsetFactory | None = None,
@@ -411,16 +1191,20 @@ def create_subagent_toolset(  # noqa: C901
     max_chat_traces: int = 100,
     max_task_handles: int = 500,
     max_result_chars: int | None = 2000,
-) -> FunctionToolset[Any]:
+    ask_timeout_seconds: float = DEFAULT_ASK_TIMEOUT_SECONDS,
+    contain_errors: bool = True,
+) -> SubAgentToolset:
     """Create a toolset for delegating tasks to subagents.
 
     This is the main entry point for using the subagent system. It creates
     a toolset with tools for:
+
     - `create_agent`: Create a reusable, registry-backed specialist (opt-in modes)
     - `task`: Delegate a task to a configured or registry-backed specialist
     - `delegate`: Create and run an ephemeral specialist in one call (opt-in modes)
     - `check_task`: Check status of an async task
     - `answer_subagent`: Answer a question from a subagent
+    - `send_message_to_subagent`: Steer a running async subagent
     - `list_active_tasks`: List all running background tasks
     - `wait_tasks`: Wait for one or more background tasks to finish
     - `soft_cancel_task`: Request cooperative cancellation
@@ -434,12 +1218,15 @@ def create_subagent_toolset(  # noqa: C901
             Called with deps when running a task.
         include_general_purpose: Whether to include the default general-purpose
             subagent. Set to False if you want only specialized subagents.
-        max_nesting_depth: Maximum depth for nested subagents. 0 means
-            subagents cannot spawn their own subagents.
+        max_nesting_depth: Depth budget handed to `deps.clone_for_subagent`, which
+            decides what a subagent may delegate to in turn. This library does not
+            itself stop a nested toolset from delegating further -- the gate is
+            whatever `toolsets_factory` gives the child.
         id: Optional toolset ID. Defaults to "subagents".
         descriptions: Optional mapping of tool name to custom description.
-            Keys are tool names (task, check_task, answer_subagent,
-            list_active_tasks, wait_tasks, soft_cancel_task, hard_cancel_task).
+            Keys are tool names (`task`, `create_agent`, `delegate`, `check_task`,
+            `answer_subagent`, `send_message_to_subagent`, `list_active_tasks`,
+            `wait_tasks`, `soft_cancel_task`, `hard_cancel_task`).
             When provided, the custom description replaces the built-in default.
         ask_user: Optional callback invoked when a subagent calls `ask_parent`
             in sync mode. Receives the question and must return the answer.
@@ -492,15 +1279,23 @@ def create_subagent_toolset(  # noqa: C901
             flooding the orchestrator's context. Results past the budget are cut
             and carry an explicit marker pointing at `check_task`, which always
             returns the full text. Pass `None` to never truncate.
+        ask_timeout_seconds: How long `ask_parent` waits for the parent's answer
+            before telling the subagent to proceed on its own.
+        contain_errors: Whether an unexpected subagent crash is converted into a
+            `ModelRetry` for the parent instead of aborting the parent run.
+            Defaults to `True`. Control-flow signals (`CallDeferred`,
+            `ApprovalRequired`, `Skip*`), `UserError`, and a shared
+            `UsageLimitExceeded` always propagate. Individual subagents can
+            override this with `SubAgentConfig["contain_errors"]`.
 
     Returns:
-        FunctionToolset configured with subagent management tools.
+        A `SubAgentToolset` configured with the subagent management tools.
 
     Raises:
-        ValueError: If `max_result_chars` is negative; if
-            `delegation_configuration` is invalid; if `"oneshot_only"` is
-            combined with `subagents` or a `registry`, neither of which is
-            reachable without `task`; or if a mode exposing neither
+        ValueError: If `max_result_chars` is negative; if `ask_timeout_seconds` is
+            not positive; if `delegation_configuration` is invalid; if
+            `"oneshot_only"` is combined with `subagents` or a `registry`, neither
+            of which is reachable without `task`; or if a mode exposing neither
             `create_agent` nor `delegate` is given `allowed_models`,
             `capabilities_map`, or `default_agent_factory`, which only those
             tools consult.
@@ -526,944 +1321,25 @@ def create_subagent_toolset(  # noqa: C901
         agent = Agent("openai:gpt-4.1", toolsets=[toolset])
         ```
     """
-    valid_configurations = {
-        "default",
-        "persisted",
-        "persisted_and_oneshot",
-        "oneshot_only",
-    }
-    if delegation_configuration not in valid_configurations:
-        valid = ", ".join(sorted(valid_configurations))
-        raise ValueError(
-            f"Invalid delegation_configuration '{delegation_configuration}'. "
-            f"Expected one of: {valid}"
-        )
-
-    expose_create_agent = delegation_configuration in {
-        "persisted",
-        "persisted_and_oneshot",
-    }
-    expose_task = delegation_configuration != "oneshot_only"
-    expose_delegate = delegation_configuration in {
-        "persisted_and_oneshot",
-        "oneshot_only",
-    }
-
-    # Hiding a tool also hides everything only that tool reads, so configuration
-    # for a hidden tool can never take effect. Rejecting it here surfaces the
-    # contradiction at construction, where the caller can still see their own
-    # arguments; dropping it silently only shows up as a subagent that ignores
-    # an allow-list, or a capability the model is never offered.
-    if not expose_task:
-        if subagents:
-            raise ValueError(
-                f"delegation_configuration={delegation_configuration!r} cannot be combined "
-                "with non-empty subagents; configured subagents would be unreachable "
-                "without the task tool. Omit subagents, or use a mode that exposes task."
-            )
-        if registry is not None:
-            raise ValueError(
-                f"delegation_configuration={delegation_configuration!r} cannot be combined "
-                "with a registry; registry-backed agents are only reachable through the "
-                "task tool. Omit registry, or use a mode that exposes task."
-            )
-
-    if not expose_create_agent and not expose_delegate:
-        unreachable = [
-            name
-            for name, value in (
-                ("allowed_models", allowed_models),
-                ("capabilities_map", capabilities_map),
-                ("default_agent_factory", default_agent_factory),
-            )
-            if value is not None
-        ]
-        if unreachable:
-            raise ValueError(
-                f"delegation_configuration={delegation_configuration!r} exposes no "
-                f"dynamic-agent tool, so {', '.join(unreachable)} would be ignored. "
-                "Use 'persisted', 'persisted_and_oneshot', or 'oneshot_only'."
-            )
-
-    if max_result_chars is not None and max_result_chars < 0:
-        raise ValueError(f"max_result_chars must be >= 0 or None, got {max_result_chars}")
-
-    _descs = descriptions or {}
-    active_registry = (
-        registry if registry is not None else DynamicAgentRegistry(max_agents=max_agents)
+    return SubAgentToolset(
+        subagents=subagents,
+        default_model=default_model,
+        toolsets_factory=toolsets_factory,
+        include_general_purpose=include_general_purpose,
+        max_nesting_depth=max_nesting_depth,
+        id=id,
+        registry=registry,
+        descriptions=descriptions,
+        ask_user=ask_user,
+        usage_limits=usage_limits,
+        delegation_configuration=delegation_configuration,
+        allowed_models=allowed_models,
+        capabilities_map=capabilities_map,
+        default_agent_factory=default_agent_factory,
+        max_agents=max_agents,
+        max_chat_traces=max_chat_traces,
+        max_task_handles=max_task_handles,
+        max_result_chars=max_result_chars,
+        ask_timeout_seconds=ask_timeout_seconds,
+        contain_errors=contain_errors,
     )
-
-    # Build subagent configs
-    configs: list[SubAgentConfig] = list(subagents) if subagents else []
-    if include_general_purpose and expose_task:
-        configs.append(_create_general_purpose_config())
-
-    # Compile subagents
-    compiled: dict[str, CompiledSubAgent] = {}
-    for config in configs:
-        compiled[config["name"]] = _compile_subagent(config, default_model)
-
-    # Create shared state
-    message_bus = InMemoryMessageBus()
-    task_manager = TaskManager(message_bus=message_bus)
-    # LRU-ordered: oldest chat trace first, evicted past max_chat_traces.
-    message_history_store: OrderedDict[tuple[str, str], list[Any]] = OrderedDict()
-    # Chat traces with a task currently running — a trace must finish before
-    # it can be continued, otherwise concurrent saves would lose history.
-    active_chat_traces: set[tuple[str, str]] = set()
-    # Usage from evicted handles, so get_total_usage() survives eviction.
-    evicted_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "requests": 0}
-
-    _terminal_statuses = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
-
-    def evict_finished_handles() -> None:
-        """Drop the oldest finished handles past `max_task_handles`.
-
-        Running/waiting tasks are never evicted. Evicted usage is accumulated
-        into `evicted_usage` so `get_total_usage()` stays correct.
-        """
-        finished = [h for h in task_manager.handles.values() if h.status in _terminal_statuses]
-        overflow = len(finished) - max_task_handles
-        if overflow <= 0:
-            return
-        finished.sort(key=lambda h: h.completed_at or h.created_at)
-        for old in finished[:overflow]:
-            if old.usage is not None:
-                evicted_usage["input_tokens"] += getattr(old.usage, "input_tokens", 0)
-                evicted_usage["output_tokens"] += getattr(old.usage, "output_tokens", 0)
-                evicted_usage["requests"] += getattr(old.usage, "requests", 0)
-            task_manager.handles.pop(old.task_id, None)
-
-    # Build dynamic task description with available subagents
-    subagent_list = "\n".join(f"- {name}: {c.description}" for name, c in compiled.items())
-    task_description = _descs.get(
-        "task",
-        TASK_TOOL_DESCRIPTION.rstrip() + f"\n\nAvailable subagent types:\n{subagent_list}",
-    )
-
-    toolset: FunctionToolset[Any] = FunctionToolset(id=id or "subagents")
-
-    models_desc = (
-        f"Allowed models: {', '.join(allowed_models)}" if allowed_models else "Any model is allowed"
-    )
-    caps_desc = (
-        f"Available capabilities: {', '.join(capabilities_map.keys())}"
-        if capabilities_map
-        else "No predefined capabilities available"
-    )
-
-    async def execute_compiled_subagent(
-        ctx: RunContext[SubAgentDepsProtocol],
-        subagent: CompiledSubAgent,
-        description: str,
-        *,
-        mode: ExecutionMode,
-        priority: TaskPriority,
-        complexity: Literal["simple", "moderate", "complex"] | None,
-        requires_user_context: bool,
-        may_need_clarification: bool,
-        inject_ask_parent: bool = False,
-        task_id: str | None = None,
-        chat_trace_id: str | None = None,
-        persist_chat_trace: bool = True,
-    ) -> str:
-        """Run a compiled subagent with chat-trace and observability support.
-
-        `persist_chat_trace` must be `False` for a subagent the orchestrator
-        cannot address by name later — a one-shot specialist. A chat trace is
-        only worth handing out if `task` can resolve the subagent it belongs to,
-        and storing one costs a slot in the `max_chat_traces` LRU that a
-        continuable conversation would otherwise keep.
-        """
-        config = subagent.config
-        agent = subagent.agent
-
-        if agent is None:
-            return f"Error: Subagent '{subagent.name}' is not properly initialized"
-
-        resolved_usage_limits = (
-            usage_limits(ctx, config) if callable(usage_limits) else usage_limits
-        )
-
-        parent_deps = ctx.deps
-        subagent_deps = parent_deps.clone_for_subagent(max_nesting_depth - 1)
-
-        runtime_toolsets: list[Any] | None = None
-        if toolsets_factory or inject_ask_parent:
-            runtime_toolsets = []
-            if inject_ask_parent and config.get("can_ask_questions", True):
-                runtime_toolsets.append(_create_ask_parent_toolset())
-            if toolsets_factory:
-                runtime_toolsets.extend(toolsets_factory(subagent_deps))
-
-        actual_task_id = task_id or str(uuid.uuid4())[:8]
-
-        effective_chat_trace_id = chat_trace_id or uuid.uuid4().hex
-        chat_trace_key = (config["name"], effective_chat_trace_id)
-        if chat_trace_key in active_chat_traces:
-            return (
-                f"Error: chat trace '{effective_chat_trace_id}' already has a running "
-                f"task on subagent '{config['name']}'. Wait for it to finish "
-                f"(check_task/wait_tasks) before continuing this conversation."
-            )
-        message_history = message_history_store.get(chat_trace_key)
-        if message_history is not None:
-            message_history_store.move_to_end(chat_trace_key)
-        elif chat_trace_id is not None:
-            return (
-                f"Error: no saved conversation for chat_trace_id '{chat_trace_id}' "
-                f"with subagent '{config['name']}' (unknown, evicted, or its first "
-                f"run failed). Omit chat_trace_id to start a new conversation."
-            )
-
-        def save_message_history(messages: list[Any]) -> None:
-            message_history_store[chat_trace_key] = messages
-            message_history_store.move_to_end(chat_trace_key)
-            while len(message_history_store) > max_chat_traces:
-                message_history_store.popitem(last=False)
-
-        # A one-shot run exposes no chat trace, so it neither stores history nor
-        # reports an id: `handle.chat_trace_id` stays `None` and check_task /
-        # wait_tasks skip it for the same reason the returned text does.
-        on_history = save_message_history if persist_chat_trace else None
-        reported_chat_trace_id = effective_chat_trace_id if persist_chat_trace else None
-
-        evict_finished_handles()
-
-        if mode == "auto":
-            characteristics = TaskCharacteristics(
-                estimated_complexity=complexity or config.get("typical_complexity", "moderate"),
-                requires_user_context=requires_user_context
-                or config.get("typically_needs_context", False),
-                may_need_clarification=may_need_clarification,
-            )
-            resolved_mode = decide_execution_mode(characteristics, config)
-        else:
-            resolved_mode = mode
-
-        if resolved_mode == "sync":
-            handle = TaskHandle(
-                task_id=actual_task_id,
-                subagent_name=config["name"],
-                description=description,
-                status=TaskStatus.RUNNING,
-                priority=priority,
-                chat_trace_id=reported_chat_trace_id,
-                started_at=datetime.now(),
-            )
-            task_manager.handles[actual_task_id] = handle
-            active_chat_traces.add(chat_trace_key)
-            try:
-                result = await _run_sync(
-                    agent=agent,
-                    config=config,
-                    description=description,
-                    deps=subagent_deps,
-                    task_id=actual_task_id,
-                    extra_toolsets=runtime_toolsets,
-                    ask_user=ask_user,
-                    usage_limits=resolved_usage_limits,
-                    handle=handle,
-                    message_history=message_history,
-                    on_message_history=on_history,
-                )
-            finally:
-                active_chat_traces.discard(chat_trace_key)
-            if persist_chat_trace and (
-                handle.status != TaskStatus.FAILED or chat_trace_key in message_history_store
-            ):
-                return _format_chat_trace_result(result, effective_chat_trace_id)
-            return result
-
-        active_chat_traces.add(chat_trace_key)
-        try:
-            return await _run_async(
-                agent=agent,
-                config=config,
-                description=description,
-                deps=subagent_deps,
-                task_id=actual_task_id,
-                task_manager=task_manager,
-                message_bus=message_bus,
-                extra_toolsets=runtime_toolsets,
-                priority=priority,
-                usage_limits=resolved_usage_limits,
-                chat_trace_id=reported_chat_trace_id,
-                message_history=message_history,
-                on_message_history=on_history,
-                on_run_finished=lambda: active_chat_traces.discard(chat_trace_key),
-            )
-        except BaseException:
-            active_chat_traces.discard(chat_trace_key)
-            raise
-
-    if expose_create_agent:
-        create_agent_description = _descs.get(
-            "create_agent",
-            "Create a reusable specialized agent at runtime. The agent is stored "
-            "in the registry and can be used repeatedly with the task tool.\n\n"
-            f"{models_desc}\n{caps_desc}\n\n"
-            f"Default model when none is given: {default_model}.",
-        )
-
-        @toolset.tool(description=create_agent_description)
-        async def create_agent(
-            ctx: RunContext[SubAgentDepsProtocol],
-            name: str,
-            description: str,
-            instructions: str,
-            model: str | None = None,
-            capabilities: list[str] | None = None,
-            can_ask_questions: bool = True,
-        ) -> str:
-            """Create and register a reusable specialized agent."""
-            if active_registry.exists(name):
-                return f"Error: Agent '{name}' already exists"
-
-            actual_model = model or default_model
-            result = build_dynamic_agent(
-                ctx,
-                name=name,
-                description=description,
-                instructions=instructions,
-                model=actual_model,
-                can_ask_questions=can_ask_questions,
-                capabilities=capabilities,
-                allowed_models=allowed_models,
-                toolsets_factory=None,
-                capabilities_map=capabilities_map,
-                default_agent_factory=default_agent_factory,
-            )
-            if isinstance(result, str):
-                return result
-            agent, config = result
-
-            try:
-                active_registry.register(config, agent)
-            except ValueError as exc:
-                return f"Error: {exc}"
-
-            caps_info = f"\nCapabilities: {', '.join(capabilities)}" if capabilities else ""
-            return (
-                f"Agent '{name}' created successfully.\n"
-                f"Model: {actual_model}\n"
-                f"Description: {description}{caps_info}\n"
-                f"Use task(description, '{name}') to delegate tasks."
-            )
-
-    if expose_task:
-
-        @toolset.tool(description=task_description)
-        async def task(
-            ctx: RunContext[SubAgentDepsProtocol],
-            description: str,
-            subagent_type: str,
-            mode: ExecutionMode = "sync",
-            priority: TaskPriority = TaskPriority.NORMAL,
-            complexity: Literal["simple", "moderate", "complex"] | None = None,
-            requires_user_context: bool = False,
-            may_need_clarification: bool = False,
-            chat_trace_id: str | None = None,
-        ) -> str:
-            """Delegate a task to a specialized subagent.
-
-            Args:
-                ctx: The run context with dependencies.
-                description: Detailed description of the task to perform.
-                subagent_type: Name of the subagent to use.
-                mode: Execution mode - "sync" (blocking), "async" (background), or "auto".
-                priority: Task priority level (for async tasks).
-                complexity: Override complexity estimate ("simple", "moderate", "complex").
-                requires_user_context: Whether task needs ongoing user interaction.
-                may_need_clarification: Whether task might need clarifying questions.
-                chat_trace_id: Optional explicit chat trace ID. When omitted, a new subagent
-                    conversation is created. When provided, this subagent resumes from
-                    the previous successful task with the same chat trace.
-            """
-            if subagent_type in compiled:
-                subagent = compiled[subagent_type]
-                inject_ask_parent = False
-            elif (registry_subagent := active_registry.get_compiled(subagent_type)) is not None:
-                subagent = registry_subagent
-                inject_ask_parent = True
-            else:
-                available_names = list(compiled.keys())
-                available_names.extend(active_registry.list_agents())
-                available = ", ".join(available_names)
-                return f"Error: Unknown subagent '{subagent_type}'. Available: {available}"
-
-            return await execute_compiled_subagent(
-                ctx,
-                subagent,
-                description,
-                mode=mode,
-                priority=priority,
-                complexity=complexity,
-                requires_user_context=requires_user_context,
-                may_need_clarification=may_need_clarification,
-                inject_ask_parent=inject_ask_parent,
-                chat_trace_id=chat_trace_id,
-            )
-
-    if expose_delegate:
-        delegate_description = _descs.get(
-            "delegate",
-            DELEGATE_TOOL_DESCRIPTION.rstrip()
-            + f"\n\n{models_desc}\n{caps_desc}\n\n"
-            + f"Default model when none is given: {default_model}.",
-        )
-
-        @toolset.tool(description=delegate_description)
-        async def delegate(
-            ctx: RunContext[SubAgentDepsProtocol],
-            description: str,
-            instructions: str,
-            model: str | None = None,
-            capabilities: list[str] | None = None,
-            can_ask_questions: bool = True,
-            mode: ExecutionMode = "sync",
-            priority: TaskPriority = TaskPriority.NORMAL,
-            complexity: Literal["simple", "moderate", "complex"] | None = None,
-            requires_user_context: bool = False,
-            may_need_clarification: bool = False,
-        ) -> str:
-            """Create an ephemeral specialist and delegate a task in one call."""
-            task_id = str(uuid.uuid4())[:8]
-            agent_name = f"oneshot-{task_id}"
-            agent_description = description[:120] or "Ephemeral specialist"
-            actual_model = model or default_model
-
-            result = build_dynamic_agent(
-                ctx,
-                name=agent_name,
-                description=agent_description,
-                instructions=instructions,
-                model=actual_model,
-                can_ask_questions=can_ask_questions,
-                capabilities=capabilities,
-                allowed_models=allowed_models,
-                toolsets_factory=None,
-                capabilities_map=capabilities_map,
-                default_agent_factory=default_agent_factory,
-            )
-            if isinstance(result, str):
-                return result
-            agent, config = result
-
-            subagent = CompiledSubAgent(
-                name=agent_name,
-                description=agent_description,
-                agent=agent,
-                config=config,
-            )
-
-            return await execute_compiled_subagent(
-                ctx,
-                subagent,
-                description,
-                mode=mode,
-                priority=priority,
-                complexity=complexity,
-                requires_user_context=requires_user_context,
-                may_need_clarification=may_need_clarification,
-                inject_ask_parent=True,
-                task_id=task_id,
-                persist_chat_trace=False,
-            )
-
-    @toolset.tool(description=_descs.get("check_task", CHECK_TASK_DESCRIPTION))
-    async def check_task(
-        ctx: RunContext[SubAgentDepsProtocol],
-        task_id: str,
-    ) -> str:
-        """Check the status of a background task.
-
-        Args:
-            ctx: The run context.
-            task_id: The task ID returned when the task was started.
-        """
-        handle = task_manager.get_handle(task_id)
-        if handle is None:
-            return f"Error: Task '{task_id}' not found"
-
-        status_info = [
-            f"Task: {task_id}",
-            f"Subagent: {handle.subagent_name}",
-            f"Status: {handle.status}",
-            f"Description: {handle.description}",
-        ]
-        # Only advertise continuation for completed tasks — a failed or still
-        # running task has not saved this run's history yet (matches wait_tasks).
-        if handle.chat_trace_id is not None and handle.status == TaskStatus.COMPLETED:
-            status_info.append(f"Chat Trace ID: {handle.chat_trace_id}")
-
-        if handle.status == TaskStatus.COMPLETED:
-            status_info.append(f"Result: {handle.result}")
-        elif handle.status == TaskStatus.FAILED:
-            status_info.append(f"Error: {handle.error}")
-        elif handle.status == TaskStatus.WAITING_FOR_ANSWER:
-            status_info.append(f"Question: {handle.pending_question}")
-        elif handle.started_at:
-            elapsed = (datetime.now() - handle.started_at).total_seconds()
-            status_info.append(f"Running for: {elapsed:.1f}s")
-
-        return "\n".join(status_info)
-
-    @toolset.tool(description=_descs.get("answer_subagent", ANSWER_SUBAGENT_DESCRIPTION))
-    async def answer_subagent(
-        ctx: RunContext[SubAgentDepsProtocol],
-        task_id: str,
-        answer: str,
-    ) -> str:
-        """Answer a question from a subagent.
-
-        Args:
-            ctx: The run context.
-            task_id: The task ID of the waiting subagent.
-            answer: Your answer to the subagent's question.
-        """
-        handle = task_manager.get_handle(task_id)
-        if handle is None:
-            return f"Error: Task '{task_id}' not found"
-
-        if handle.status != TaskStatus.WAITING_FOR_ANSWER:
-            return f"Error: Task '{task_id}' is not waiting for an answer (status: {handle.status})"
-
-        # Resolve the answer future that ask_parent is waiting on
-        future = task_manager.get_answer_future(task_id)
-        if future is not None and not future.done():
-            future.set_result(answer)
-            return f"Answer sent to task '{task_id}'"
-
-        return "Error: Could not send answer - subagent is no longer waiting"
-
-    @toolset.tool(
-        description=_descs.get("send_message_to_subagent", SEND_MESSAGE_TO_SUBAGENT_DESCRIPTION)
-    )
-    async def send_message_to_subagent(
-        ctx: RunContext[SubAgentDepsProtocol],
-        task_id: str,
-        message: str,
-    ) -> str:
-        """Steer a running async subagent with an unprompted message.
-
-        The message is queued for the subagent and folded into its next model
-        request as an extra user instruction, so it adapts without losing
-        partial progress. Works only while the task is still running.
-
-        Args:
-            ctx: The run context.
-            task_id: The task ID of the running async subagent.
-            message: The steering instruction to deliver.
-        """
-        agent_id = f"subagent-{task_id}"
-        if not message_bus.is_registered(agent_id):
-            handle = task_manager.get_handle(task_id)
-            if handle is None:
-                return f"Error: Task '{task_id}' not found"
-            return (
-                f"Error: Task '{task_id}' is not accepting messages "
-                f"(status: {handle.status}). Steering only works for running "
-                "async tasks."
-            )
-
-        await message_bus.send(
-            AgentMessage(
-                type=MessageType.TASK_UPDATE,
-                sender="parent",
-                receiver=agent_id,
-                payload={"message": message},
-                task_id=task_id,
-            )
-        )
-        return (
-            f"Message delivered to task '{task_id}'; "
-            "it will be applied on the subagent's next step."
-        )
-
-    @toolset.tool(description=_descs.get("list_active_tasks", LIST_ACTIVE_TASKS_DESCRIPTION))
-    async def list_active_tasks(
-        ctx: RunContext[SubAgentDepsProtocol],
-    ) -> str:
-        """List all active background tasks."""
-        active_ids = task_manager.list_active_tasks()
-
-        if not active_ids:
-            return "No active background tasks."
-
-        lines = ["Active background tasks:"]
-        for tid in active_ids:
-            handle = task_manager.get_handle(tid)
-            if handle:  # pragma: no branch
-                desc = handle.description[:50]
-                lines.append(f"- {tid}: {handle.subagent_name} ({handle.status}) - {desc}...")
-
-        return "\n".join(lines)
-
-    @toolset.tool(description=_descs.get("wait_tasks", WAIT_TASKS_DESCRIPTION))
-    async def wait_tasks(
-        ctx: RunContext[SubAgentDepsProtocol],
-        task_ids: list[str],
-        timeout: float = 300.0,
-        mode: Literal["all", "any"] = "all",
-    ) -> str:
-        """Wait for multiple background tasks to complete.
-
-        Args:
-            ctx: The run context.
-            task_ids: List of task IDs to wait for.
-            timeout: Maximum seconds to wait (default 300s / 5 minutes).
-            mode: `"all"` (default) waits for every task to finish.
-                `"any"` returns as soon as one task reaches a terminal
-                state (completed, failed, or cancelled), so the orchestrator
-                can react to the first finisher without stalling on the
-                slowest one.
-        """
-        # Collect asyncio.Task objects for the requested task_ids
-        tasks_to_await: list[tuple[str, asyncio.Task[Any]]] = []
-        for tid in task_ids:
-            t = task_manager.tasks.get(tid)
-            if t is not None and not t.done():
-                tasks_to_await.append((tid, t))
-
-        if tasks_to_await:
-            aws = [t for _, t in tasks_to_await]
-            # Both modes route through `asyncio.wait`. Unlike
-            # `asyncio.wait_for(asyncio.gather(...))`, `asyncio.wait` does
-            # *not* cascade cancellation to its constituent tasks — neither on
-            # timeout nor when its caller is cancelled (e.g. pydantic-ai's
-            # `_call_tools` sibling-cancel hitting this tool call). Workers
-            # keep owning their lifecycle, which is what an orchestrator
-            # expects.
-            return_when = asyncio.FIRST_COMPLETED if mode == "any" else asyncio.ALL_COMPLETED
-            await asyncio.wait(aws, timeout=timeout, return_when=return_when)
-
-        # Collect results
-        lines: list[str] = []
-        finished_count = 0
-        for tid in task_ids:
-            handle = task_manager.get_handle(tid)
-            if handle is None:
-                lines.append(f"- {tid}: not found")
-                continue
-            status = handle.status
-            if status == "completed":
-                finished_count += 1
-                result_preview = _preview_result(handle.result or "", tid, max_result_chars)
-                chat_trace_line = ""
-                if handle.chat_trace_id is not None:
-                    chat_trace_line = f"Chat Trace ID: {handle.chat_trace_id}\n"
-                lines.append(
-                    f"- {tid} ({handle.subagent_name}): COMPLETED\n"
-                    f"{chat_trace_line}{result_preview}"
-                )
-            elif status == "failed":
-                finished_count += 1
-                lines.append(f"- {tid} ({handle.subagent_name}): FAILED - {handle.error}")
-            elif status == "cancelled":
-                finished_count += 1
-                lines.append(f"- {tid} ({handle.subagent_name}): CANCELLED - {handle.error}")
-            else:
-                lines.append(f"- {tid} ({handle.subagent_name}): {status}")
-
-        total = len(task_ids)
-        still_running = total - finished_count
-        header_parts = [f"mode={mode}", f"{finished_count}/{total} finished"]
-        if still_running > 0:
-            header_parts.append(f"{still_running} still running")
-        header = f"Task results ({', '.join(header_parts)}):"
-
-        return header + "\n" + "\n\n".join(lines)
-
-    @toolset.tool(description=_descs.get("soft_cancel_task", SOFT_CANCEL_TASK_DESCRIPTION))
-    async def soft_cancel_task(
-        ctx: RunContext[SubAgentDepsProtocol],
-        task_id: str,
-    ) -> str:
-        """Request cooperative cancellation of a background task.
-
-        Args:
-            ctx: The run context.
-            task_id: The task to cancel.
-        """
-        success = await task_manager.soft_cancel(task_id)
-        if success:
-            return f"Cancellation requested for task '{task_id}'"
-        return f"Error: Task '{task_id}' not found"
-
-    @toolset.tool(description=_descs.get("hard_cancel_task", HARD_CANCEL_TASK_DESCRIPTION))
-    async def hard_cancel_task(
-        ctx: RunContext[SubAgentDepsProtocol],
-        task_id: str,
-    ) -> str:
-        """Immediately cancel a background task.
-
-        Args:
-            ctx: The run context.
-            task_id: The task to cancel.
-        """
-        success = await task_manager.hard_cancel(task_id)
-        if success:
-            return f"Task '{task_id}' has been cancelled"
-        return f"Error: Task '{task_id}' not found"
-
-    # Expose task_manager for external monitoring (e.g., push notifications)
-    toolset.task_manager = task_manager  # type: ignore[attr-defined]
-    toolset.message_history_store = message_history_store  # type: ignore[attr-defined]
-
-    def get_total_usage() -> dict[str, int]:
-        """Get aggregate token usage across all completed subagent tasks.
-
-        Returns dict with `input_tokens`, `output_tokens`, `total_tokens`, `requests`.
-        """
-        totals: dict[str, int] = {
-            "input_tokens": evicted_usage["input_tokens"],
-            "output_tokens": evicted_usage["output_tokens"],
-            "total_tokens": 0,
-            "requests": evicted_usage["requests"],
-        }
-        for handle in task_manager.list_handles():
-            if handle.usage is not None:
-                totals["input_tokens"] += getattr(handle.usage, "input_tokens", 0)
-                totals["output_tokens"] += getattr(handle.usage, "output_tokens", 0)
-                totals["requests"] += getattr(handle.usage, "requests", 0)
-        totals["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
-        return totals
-
-    toolset.get_total_usage = get_total_usage  # type: ignore[attr-defined]
-
-    return toolset
-
-
-async def _run_sync(
-    agent: Any,
-    config: SubAgentConfig,
-    description: str,
-    deps: Any,
-    task_id: str,
-    extra_toolsets: list[Any] | None = None,
-    ask_user: AskUserCallback | None = None,
-    usage_limits: UsageLimits | None = None,
-    handle: TaskHandle | None = None,
-    message_history: list[Any] | None = None,
-    on_message_history: Callable[[list[Any]], None] | None = None,
-) -> str:
-    """Run a subagent task synchronously (blocking).
-
-    Args:
-        agent: The pydantic-ai Agent instance.
-        config: Subagent configuration.
-        description: Task description.
-        deps: Dependencies for the subagent.
-        task_id: Unique task identifier.
-        extra_toolsets: Additional toolsets to pass to agent.run().
-        ask_user: Optional callback for `ask_parent` in sync mode. When
-            provided, it is attached to the cloned subagent deps via
-            `_subagent_state["ask_callback"]` so `ask_parent` resolves to
-            it. The parent agent cannot answer directly in sync mode because
-            its run loop is blocked here.
-        usage_limits: Optional pydantic-ai usage limits forwarded to the
-            subagent run (honoured on every retry attempt).
-        handle: Optional task handle populated for Python-side observability.
-        message_history: Optional prior message history for a subagent chat trace.
-        on_message_history: Optional callback that receives the successful
-            run's full message history.
-
-    Returns:
-        The subagent's response.
-    """
-    can_ask = config.get("can_ask_questions", True)
-    max_questions = config.get("max_questions")
-
-    if ask_user is not None:
-        # Reuse the async-mode `_subagent_state["ask_callback"]` path so
-        # `ask_parent` has a single resolution order across both modes.
-        deps._subagent_state = {"ask_callback": ask_user}
-
-    prompt = get_task_instructions_prompt(
-        description,
-        can_ask_questions=can_ask,
-        max_questions=max_questions,
-    )
-
-    run_kwargs: dict[str, Any] = {"deps": deps}
-    if extra_toolsets:
-        run_kwargs["toolsets"] = extra_toolsets
-    if usage_limits is not None:
-        run_kwargs["usage_limits"] = usage_limits
-    if message_history is not None:
-        run_kwargs["message_history"] = message_history
-    if handle is not None and handle.chat_trace_id is not None:
-        run_kwargs["conversation_id"] = handle.chat_trace_id
-
-    try:
-        result = await run_with_retry(
-            agent,
-            prompt,
-            run_kwargs=run_kwargs,
-            retry=RetryConfig.from_config(config),
-        )
-        _capture_message_history(result, on_message_history)
-        output = _serialize_output(result.output)
-        if handle is not None:
-            handle.result = output
-            handle.error = None
-            handle.status = TaskStatus.COMPLETED
-            handle.completed_at = datetime.now()
-            # Telemetry is best-effort and runs after the run is marked complete,
-            # so a capture failure can never flip a successful run to FAILED.
-            _capture_observability_best_effort(handle, result)
-        return output
-    except Exception as e:
-        if handle is not None:
-            handle.status = TaskStatus.FAILED
-            handle.error = str(e)
-            handle.completed_at = datetime.now()
-        return f"Error executing task: {e}"
-
-
-async def _run_async(
-    agent: Any,
-    config: SubAgentConfig,
-    description: str,
-    deps: Any,
-    task_id: str,
-    task_manager: TaskManager,
-    message_bus: InMemoryMessageBus,
-    priority: TaskPriority = TaskPriority.NORMAL,
-    extra_toolsets: list[Any] | None = None,
-    usage_limits: UsageLimits | None = None,
-    chat_trace_id: str | None = None,
-    message_history: list[Any] | None = None,
-    on_message_history: Callable[[list[Any]], None] | None = None,
-    on_run_finished: Callable[[], None] | None = None,
-) -> str:
-    """Run a subagent task asynchronously (background).
-
-    Args:
-        agent: The pydantic-ai Agent instance.
-        config: Subagent configuration.
-        description: Task description.
-        deps: Dependencies for the subagent.
-        task_id: Unique task identifier.
-        task_manager: Task manager for tracking.
-        message_bus: Message bus for communication.
-        priority: Task priority level.
-        extra_toolsets: Additional toolsets to pass to agent.run().
-        usage_limits: Optional pydantic-ai usage limits forwarded to the
-            subagent run (honoured on every retry attempt).
-        chat_trace_id: Optional chat trace ID for continuing this subagent
-            conversation.
-        message_history: Optional prior message history for a subagent chat trace.
-        on_message_history: Optional callback that receives the successful
-            run's full message history.
-        on_run_finished: Optional callback invoked exactly once when the
-            background run finishes (completed, failed, or cancelled). Used to
-            release the chat trace for continuation.
-
-    Returns:
-        Task handle information as string.
-    """
-    # Create task handle
-    handle = TaskHandle(
-        task_id=task_id,
-        subagent_name=config["name"],
-        description=description,
-        status=TaskStatus.PENDING,
-        priority=priority,
-        chat_trace_id=chat_trace_id,
-    )
-
-    # Register subagent for messaging
-    agent_id = f"subagent-{task_id}"
-    try:
-        message_bus.register_agent(agent_id)
-    except ValueError:
-        pass  # Already registered
-
-    # Inject _subagent_state on deps so ask_parent can communicate with parent
-    deps._subagent_state = {
-        "task_manager": task_manager,
-        "task_id": task_id,
-    }
-
-    async def run_task() -> None:
-        """Execute the task and update handle."""
-        can_ask = config.get("can_ask_questions", True)
-        max_questions = config.get("max_questions")
-
-        prompt = get_task_instructions_prompt(
-            description,
-            can_ask_questions=can_ask,
-            max_questions=max_questions,
-        )
-
-        run_kwargs: dict[str, Any] = {"deps": deps}
-        if extra_toolsets:
-            run_kwargs["toolsets"] = extra_toolsets
-        if usage_limits is not None:
-            run_kwargs["usage_limits"] = usage_limits
-        if message_history is not None:
-            run_kwargs["message_history"] = message_history
-        if chat_trace_id is not None:
-            run_kwargs["conversation_id"] = chat_trace_id
-
-        def _on_retry(attempt: int, exc: BaseException, delay: float) -> None:
-            handle.status = TaskStatus.RETRYING
-            handle.retry_count = attempt
-            handle.error = f"Transient error (retry {attempt}): {exc}"
-
-        def _cancel_requested() -> bool:
-            # Cooperative (soft) cancellation: TaskManager.soft_cancel sets this
-            # event, and run_with_retry polls it between graph nodes so the
-            # subagent stops at a clean boundary. Raised CancelledError is
-            # handled by the `except asyncio.CancelledError` branch below.
-            cancel_event = task_manager.get_cancel_event(task_id)
-            return cancel_event is not None and cancel_event.is_set()
-
-        async def _pending_steering() -> list[str]:
-            return await _drain_steering_messages(message_bus, agent_id)
-
-        try:
-            result = await run_with_retry(
-                agent,
-                prompt,
-                run_kwargs=run_kwargs,
-                retry=RetryConfig.from_config(config),
-                on_retry=_on_retry,
-                cancel_check=_cancel_requested,
-                inject_messages=_pending_steering,
-            )
-            _capture_message_history(result, on_message_history)
-            handle.result = _serialize_output(result.output)
-            handle.error = None
-            handle.status = TaskStatus.COMPLETED
-            # Telemetry is best-effort and runs after the run is marked complete,
-            # so a capture failure can never flip a successful run to FAILED.
-            _capture_observability_best_effort(handle, result)
-        except asyncio.CancelledError:
-            handle.status = TaskStatus.CANCELLED
-            handle.error = "Task was cancelled"
-        except Exception as e:
-            handle.status = TaskStatus.FAILED
-            handle.error = str(e)
-        finally:
-            handle.completed_at = datetime.now()
-            message_bus.unregister_agent(agent_id)
-            task_manager.clear_answer_future(task_id)
-            task_manager.cleanup_task(task_id)
-            if on_run_finished is not None:
-                on_run_finished()
-
-    # Create the background task
-    task_manager.create_task(task_id, run_task(), handle)
-
-    response = f"Task started in background.\nTask ID: {task_id}\nSubagent: {config['name']}\n"
-    if chat_trace_id is not None:
-        response += f"Chat Trace ID: {chat_trace_id}\n"
-    response += f"Use check_task('{task_id}') to check status."
-    return response
-
-
-# Alias for backwards compatibility
-SubAgentToolset = create_subagent_toolset

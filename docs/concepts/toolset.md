@@ -185,6 +185,7 @@ Create an ephemeral specialist and delegate a task in one call. Available in
 delegate(
     description="Analyze this dataset and summarize key trends",
     instructions="You are a data analyst. Return concise findings.",
+    name="data-analyst",
     mode="sync",
 )
 ```
@@ -195,12 +196,14 @@ delegate(
 |-----------|------|-------------|
 | `description` | `str` | Task prompt for the specialist |
 | `instructions` | `str` | Specialist system prompt |
+| `name` | `str` | Label for logs and async task handles (letters, numbers, hyphens) |
 | `model` | `str \| None` | Optional model override |
 | `capabilities` | `list[str] \| None` | Optional capability names |
 | `can_ask_questions` | `bool` | Whether the specialist can ask the parent |
 | `mode` | `str` | `"sync"`, `"async"`, or `"auto"` |
 
-The specialist is not registered and cannot be reused by name.
+The specialist is not registered and cannot be reused via `task`, even though it
+has a `name`.
 
 ### check_task
 
@@ -395,25 +398,33 @@ toolset = create_subagent_toolset(
 )
 ```
 
-## General Purpose Subagent
+## General-purpose subagent
 
-By default, a "general" subagent is added for tasks that don't match specific subagents:
+A `general-purpose` subagent is added by default, so the model has somewhere to
+send work that matches none of your specialists. Turn it off when you want the
+model restricted to the subagents you defined:
 
 ```python
-# Customize the general subagent
 toolset = create_subagent_toolset(
     subagents=subagents,
-    general_purpose_config=SubAgentConfig(
-        name="general",
-        description="Handles miscellaneous tasks",
-        instructions="You are a general-purpose assistant.",
-    ),
+    include_general_purpose=False,
 )
+```
 
-# Disable the general subagent
+To replace it rather than remove it, disable the built-in one and define your own
+with whatever instructions you want:
+
+```python
 toolset = create_subagent_toolset(
-    subagents=subagents,
-    general_purpose_config=None,
+    subagents=[
+        *subagents,
+        SubAgentConfig(
+            name="general",
+            description="Handles miscellaneous tasks",
+            instructions="You are a general-purpose assistant.",
+        ),
+    ],
+    include_general_purpose=False,
 )
 ```
 

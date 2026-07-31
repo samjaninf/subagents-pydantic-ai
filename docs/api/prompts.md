@@ -65,35 +65,3 @@ These string constants are exported for inspection and overriding. The
 ::: subagents_pydantic_ai.HARD_CANCEL_TASK_DESCRIPTION
     options:
       show_root_heading: true
-
-## Retry
-
-See [Auto-Retry](../advanced/retries.md) for a conceptual overview.
-
-### RetryConfig
-
-::: subagents_pydantic_ai.RetryConfig
-    options:
-      show_root_heading: true
-      show_source: true
-
-### run_with_retry
-
-::: subagents_pydantic_ai.run_with_retry
-    options:
-      show_root_heading: true
-      show_source: true
-
-### is_transient_error
-
-::: subagents_pydantic_ai.is_transient_error
-    options:
-      show_root_heading: true
-      show_source: true
-
-### compute_backoff_delay
-
-::: subagents_pydantic_ai.compute_backoff_delay
-    options:
-      show_root_heading: true
-      show_source: true

@@ -14,35 +14,8 @@
       show_root_heading: true
       show_source: true
 
-## InMemoryMessageBus
-
-::: subagents_pydantic_ai.InMemoryMessageBus
-    options:
-      show_root_heading: true
-      show_source: true
-
-## TaskManager
-
-::: subagents_pydantic_ai.TaskManager
-    options:
-      show_root_heading: true
-      show_source: true
-
-## create_message_bus
-
-::: subagents_pydantic_ai.create_message_bus
-    options:
-      show_root_heading: true
-      show_source: true
-
-## DynamicAgentRegistry
-
-::: subagents_pydantic_ai.DynamicAgentRegistry
-    options:
-      show_root_heading: true
-      show_source: true
-
----
+The in-memory bus, `TaskManager`, and `DynamicAgentRegistry` are documented on
+their own pages: [Message Bus](message-bus.md) and [Registry](registry.md).
 
 ## Usage Examples
 
