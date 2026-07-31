@@ -33,6 +33,9 @@ agent = Agent("openai:gpt-4.1", toolsets=[toolset])
 from subagents_pydantic_ai.capability import (
     SubAgentCapability as SubAgentCapability,
 )
+from subagents_pydantic_ai.dynamic_agent import (
+    AgentFactory as AgentFactory,
+)
 from subagents_pydantic_ai.factory import (
     create_agent_factory_toolset as create_agent_factory_toolset,
 )
@@ -175,6 +178,7 @@ __all__ = [
     "ExecutionMode",
     "DelegationConfiguration",
     "ToolsetFactory",
+    "AgentFactory",
     "UsageLimitsFactory",
     "AskUserCallback",
     "CompiledSubAgent",
