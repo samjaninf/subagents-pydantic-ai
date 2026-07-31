@@ -185,6 +185,7 @@ Create an ephemeral specialist and delegate a task in one call. Available in
 delegate(
     description="Analyze this dataset and summarize key trends",
     instructions="You are a data analyst. Return concise findings.",
+    name="data-analyst",
     mode="sync",
 )
 ```
@@ -195,12 +196,14 @@ delegate(
 |-----------|------|-------------|
 | `description` | `str` | Task prompt for the specialist |
 | `instructions` | `str` | Specialist system prompt |
+| `name` | `str` | Label for logs and async task handles (letters, numbers, hyphens) |
 | `model` | `str \| None` | Optional model override |
 | `capabilities` | `list[str] \| None` | Optional capability names |
 | `can_ask_questions` | `bool` | Whether the specialist can ask the parent |
 | `mode` | `str` | `"sync"`, `"async"`, or `"auto"` |
 
-The specialist is not registered and cannot be reused by name.
+The specialist is not registered and cannot be reused via `task`, even though it
+has a `name`.
 
 ### check_task
 

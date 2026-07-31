@@ -223,6 +223,7 @@ toolset = create_subagent_toolset(
 # delegate(
 #     description="Analyze this CSV and summarize trends",
 #     instructions="You are a data analyst. Return concise findings.",
+#     name="data-analyst",
 #     mode="sync",
 # )
 ```

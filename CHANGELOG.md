@@ -118,6 +118,16 @@ entry point keeps its name and signature, so no import or call site changes.
   satisfies the protocol, so a deps class that still declares the field is
   unaffected.
 
+### Changed (breaking)
+
+- **`delegate` requires a `name`.** A one-shot specialist was labelled
+  `oneshot-{task_id}`, which told an operator reading logs or a `TaskHandle`
+  nothing about what the specialist was for. The caller now supplies the label
+  (letters, numbers, hyphens, validated the same way as `create_agent`), and it
+  becomes `TaskHandle.subagent_name`. Naming a one-shot still does not register it:
+  it does not count toward `max_agents`, cannot be reached via `task`, and reports
+  no chat trace. Any code or prompt that calls `delegate` must pass `name`.
+
 ### Changed
 
 - **`SubAgentConfig` enforces its required keys.** `name`, `description`, and

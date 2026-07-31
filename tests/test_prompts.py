@@ -45,6 +45,8 @@ class TestSystemPrompts:
         assert "ephemeral" in DELEGATE_TOOL_DESCRIPTION.lower()
         assert "create_agent" in DELEGATE_TOOL_DESCRIPTION
         assert "instructions" in DELEGATE_TOOL_DESCRIPTION
+        assert "name" in DELEGATE_TOOL_DESCRIPTION
+        assert "hyphens" in DELEGATE_TOOL_DESCRIPTION
 
 
 class TestGetSubagentSystemPrompt:

@@ -892,6 +892,7 @@ class SubAgentToolset(FunctionToolset[Any]):
         ctx: RunContext[SubAgentDepsProtocol],
         description: str,
         instructions: str,
+        name: str,
         model: str | None = None,
         capabilities: list[str] | None = None,
         can_ask_questions: bool = True,
@@ -907,6 +908,9 @@ class SubAgentToolset(FunctionToolset[Any]):
             ctx: The run context.
             description: The task for the specialist to execute.
             instructions: The specialist's system prompt.
+            name: Label for the specialist (letters, numbers, hyphens), used in
+                logs and as `TaskHandle.subagent_name`. Naming it does not
+                register it: it still cannot be reused via `task`.
             model: Model to use. Defaults to the toolset's default model.
             capabilities: Capability names to attach to the specialist.
             can_ask_questions: Whether the specialist can ask the parent questions.
@@ -917,12 +921,11 @@ class SubAgentToolset(FunctionToolset[Any]):
             may_need_clarification: Whether task might need clarifying questions.
         """
         task_id = uuid.uuid4().hex[:8]
-        agent_name = f"oneshot-{task_id}"
         agent_description = description[:120] or "Ephemeral specialist"
 
         result = build_dynamic_agent(
             ctx,
-            name=agent_name,
+            name=name,
             description=agent_description,
             instructions=instructions,
             model=model or self._default_model,
@@ -940,7 +943,7 @@ class SubAgentToolset(FunctionToolset[Any]):
         return await self._execute(
             ctx,
             CompiledSubAgent(
-                name=agent_name,
+                name=name,
                 description=agent_description,
                 agent=agent,
                 config=config,

@@ -4148,11 +4148,60 @@ class TestDelegationConfiguration:
                 ctx,
                 description="Analyze the data",
                 instructions="You are a data analyst.",
+                name="data-analyst",
             )
 
         # No chat trace: a one-shot specialist is unreachable from `task`, so an
         # id the orchestrator cannot redeem would only invite a failed retry.
         assert result == "oneshot result"
+
+    @pytest.mark.asyncio
+    async def test_delegate_names_the_handle(self):
+        """The caller's `name` is what shows up on the task handle.
+
+        A generated `oneshot-{task_id}` told an operator nothing about what the
+        specialist was for.
+        """
+        toolset = create_subagent_toolset(
+            delegation_configuration="persisted_and_oneshot",
+            include_general_purpose=False,
+        )
+        ctx = MockRunContext(deps=MockDeps())
+
+        with patch("subagents_pydantic_ai.dynamic_agent.Agent") as mock_agent_class:
+            mock_agent_class.return_value = FakeAgent(result=MockResult("named result"))
+            start_result = await toolset.tools["delegate"].function(
+                ctx,
+                description="Analyze the data",
+                instructions="You are a data analyst.",
+                name="data-analyst",
+                mode="async",
+            )
+
+        assert "Task ID:" in start_result
+        task_id = start_result.split("Task ID: ")[1].split("\n")[0]
+        handle = toolset.task_manager.get_handle(task_id)
+        assert handle is not None
+        assert handle.subagent_name == "data-analyst"
+
+    @pytest.mark.asyncio
+    async def test_delegate_rejects_an_invalid_name(self):
+        """Names go through the same validation as `create_agent`."""
+        toolset = create_subagent_toolset(
+            delegation_configuration="persisted_and_oneshot",
+            include_general_purpose=False,
+        )
+        ctx = MockRunContext(deps=MockDeps())
+
+        result = await toolset.tools["delegate"].function(
+            ctx,
+            description="Analyze the data",
+            instructions="You are a data analyst.",
+            name="bad name",
+        )
+
+        assert "Error" in result
+        assert "letters, numbers, and hyphens" in result
 
     @pytest.mark.asyncio
     async def test_delegate_does_not_register_agent(self, registry):
@@ -4171,6 +4220,7 @@ class TestDelegationConfiguration:
                 ctx,
                 description="Do work",
                 instructions="You are a worker.",
+                name="worker",
             )
 
         assert result == "oneshot result"
@@ -4201,6 +4251,7 @@ class TestDelegationConfiguration:
                 ctx,
                 description="Do work",
                 instructions="You are a worker.",
+                name="worker",
             )
 
         assert result == "still works"
@@ -4222,6 +4273,7 @@ class TestDelegationConfiguration:
                 ctx,
                 description="Long analysis",
                 instructions="You are an analyst.",
+                name="analyst",
                 mode="async",
             )
 
@@ -4229,7 +4281,7 @@ class TestDelegationConfiguration:
         task_id = start_result.split("Task ID: ")[1].split("\n")[0]
         handle = toolset.task_manager.get_handle(task_id)
         assert handle is not None
-        assert handle.subagent_name.startswith("oneshot-")
+        assert handle.subagent_name == "analyst"
 
         await asyncio.sleep(0.05)
         status = await check_tool.function(ctx, task_id)
@@ -4249,6 +4301,7 @@ class TestDelegationConfiguration:
             ctx,
             description="Do work",
             instructions="You are a worker.",
+            name="worker",
             model="anthropic:claude-3",
         )
 
@@ -4269,6 +4322,7 @@ class TestDelegationConfiguration:
             ctx,
             description="Do work",
             instructions="You are a worker.",
+            name="worker",
             capabilities=["missing"],
         )
 
@@ -4291,6 +4345,7 @@ class TestDelegationConfiguration:
                     ctx,
                     description="Do work",
                     instructions="You are a worker.",
+                    name="worker",
                 )
 
     @pytest.mark.asyncio
@@ -4310,6 +4365,7 @@ class TestDelegationConfiguration:
                 ctx,
                 description="Long analysis",
                 instructions="You are an analyst.",
+                name="analyst",
                 mode="async",
             )
 
@@ -4359,7 +4415,10 @@ class TestDelegationConfiguration:
             )
             for _ in range(3):
                 await toolset.tools["delegate"].function(
-                    ctx, description="unrelated job", instructions="You are a specialist."
+                    ctx,
+                    description="unrelated job",
+                    instructions="You are a specialist.",
+                    name="specialist",
                 )
 
         resumed = await toolset.tools["task"].function(

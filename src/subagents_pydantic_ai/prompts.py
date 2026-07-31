@@ -69,6 +69,8 @@ configured subagent or create a persistent agent first
 ## Parameters
 - **description**: The task prompt for the specialist to execute
 - **instructions**: The specialist's system prompt / role definition
+- **name**: Label for logs and async task handles (letters, numbers, hyphens). \
+Naming the specialist does not register it — it still cannot be reused via `task`
 - **model**: Optional model override
 - **capabilities**: Optional capability names to attach to the specialist
 - **mode**: `"sync"` (default), `"async"`, or `"auto"`
