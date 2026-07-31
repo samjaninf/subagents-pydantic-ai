@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Configurable persistent and one-shot delegation.** `delegation_configuration` on `create_subagent_toolset` and `SubAgentCapability` selects:
+  - `"default"`: `task` only (backward-compatible)
+  - `"persisted"`: `create_agent` + `task`
+  - `"persisted_and_oneshot"`: `create_agent` + `task` + `delegate`
+  - `"oneshot_only"`: `delegate` only
+  The ephemeral `delegate` path bypasses the registry, while `create_agent` stores reusable specialists for later `task` calls. Shared dynamic-agent validation and construction logic lives in `dynamic_agent.py`.
+- **A delegation mode rejects configuration it cannot reach.** Hiding a tool also hides everything that only that tool consults, so `create_subagent_toolset` (and `SubAgentCapability`) now raise `ValueError` at construction rather than dropping the configuration in silence: `"oneshot_only"` rejects `subagents` and `registry` (both reachable only through `task`), and `"default"` rejects `allowed_models`, `capabilities_map`, and `default_agent_factory` (consulted only by `create_agent` and `delegate`).
+- **`AgentFactory` type alias** for `default_agent_factory`, replacing `Any` on `create_subagent_toolset`, `create_agent_factory_toolset`, and `SubAgentCapability`. `registry` is likewise typed `DynamicAgentRegistry | None` now that the toolset depends on that interface directly.
+
+### Fixed
+
+- **Registry-backed agents now receive `ask_parent` at run time.** Dynamic agents created via the registry previously lacked the `ask_parent` toolset that statically compiled subagents get, so `can_ask_questions` was effectively a no-op for them. The toolset now injects `ask_parent` when executing registry-backed (and one-shot) agents. Custom `default_agent_factory` implementations should not attach their own `ask_parent` toolset, or the tool name will be duplicated at run time.
+- **One-shot `delegate` no longer reports or stores a chat trace.** A `Chat Trace ID` is only redeemable if `task` can resolve the subagent it belongs to, and a one-shot specialist is never registered — so the id it handed back could not be used from any mode, while its saved history still consumed a slot in the `max_chat_traces` LRU and evicted conversations that *were* continuable. One-shot runs now leave `handle.chat_trace_id` unset, omit the id from `delegate` / `check_task` / `wait_tasks` output, and never write to the history store.
+- **Documented pairing of `create_subagent_toolset` with `create_agent_factory_toolset`.** The previous recipe in `docs/advanced/dynamic-agents.md` combined `"persisted"` with the factory toolset, which pydantic-ai rejects at run time because both define a `create_agent` tool, and let `create_agent_factory_toolset` silently overwrite the registry's `max_agents`. The documented setup now keeps the subagent toolset task-only and passes the limit to the toolset that owns creation.
+
 ## [0.2.10] - 2026-07-24
 
 ### Fixed

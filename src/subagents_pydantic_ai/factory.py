@@ -8,16 +8,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import RunContext
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import FunctionToolset
 
+from subagents_pydantic_ai.dynamic_agent import (
+    AgentFactory,
+    CapabilityFactory,
+    build_dynamic_agent,
+)
 from subagents_pydantic_ai.protocols import SubAgentDepsProtocol
 from subagents_pydantic_ai.registry import DynamicAgentRegistry
-from subagents_pydantic_ai.types import SubAgentConfig, ToolsetFactory
-
-# Type alias for capability factory functions
-CapabilityFactory = ToolsetFactory
+from subagents_pydantic_ai.types import ToolsetFactory
 
 
 def create_agent_factory_toolset(
@@ -28,7 +30,7 @@ def create_agent_factory_toolset(
     toolsets_factory: ToolsetFactory | None = None,
     capabilities_map: dict[str, CapabilityFactory] | None = None,
     id: str | None = None,
-    default_agent_factory: Any | None = None,
+    default_agent_factory: AgentFactory | None = None,
 ) -> FunctionToolset[Any]:
     """Create a toolset for dynamic agent creation.
 
@@ -41,13 +43,19 @@ def create_agent_factory_toolset(
         allowed_models: List of allowed model names. If None, any model
             is allowed.
         default_model: Default model to use when not specified.
-        max_agents: Maximum number of dynamic agents allowed.
+        max_agents: Maximum number of dynamic agents allowed. This is written
+            onto `registry.max_agents`, so it wins over whatever cap the
+            registry was constructed with — pass it explicitly when the limit
+            matters.
         toolsets_factory: Factory to create toolsets for new agents.
             Takes priority over capabilities if both are provided.
         capabilities_map: Mapping of capability names to factory functions.
             E.g., {"filesystem": create_fs_toolset, "todo": create_todo_toolset}.
             Used when capabilities are specified in create_agent.
         id: Optional toolset ID. Defaults to "agent_factory".
+        default_agent_factory: Optional builder for created agents, replacing the
+            default plain `pydantic_ai.Agent`. When set, `create_agent` rejects
+            requested `capabilities`, since the factory owns the agent's toolsets.
 
     Returns:
         FunctionToolset with agent management tools.
@@ -133,83 +141,39 @@ def create_agent_factory_toolset(
         Returns:
             Confirmation message or error.
         """
-        # Validate name
-        if not name or not all(c.isalnum() or c == "-" for c in name):
-            return "Error: Name must contain only letters, numbers, and hyphens"
-
         if registry.exists(name):
             return f"Error: Agent '{name}' already exists"
 
-        # Validate model
         actual_model = model or default_model
-        if allowed_models and actual_model not in allowed_models:
-            allowed = ", ".join(allowed_models)
-            return f"Error: Model '{actual_model}' is not allowed. Use one of: {allowed}"
-
-        # Validate capabilities
-        if capabilities and capabilities_map:
-            invalid_caps = [c for c in capabilities if c not in capabilities_map]
-            if invalid_caps:
-                available = ", ".join(capabilities_map.keys())
-                invalid = ", ".join(invalid_caps)
-                return f"Error: Unknown capabilities: {invalid}. Available: {available}"
-
-        # Create config
-        config = SubAgentConfig(
+        result = build_dynamic_agent(
+            ctx,
             name=name,
             description=description,
             instructions=instructions,
             model=actual_model,
             can_ask_questions=can_ask_questions,
+            capabilities=capabilities,
+            allowed_models=allowed_models,
+            toolsets_factory=toolsets_factory,
+            capabilities_map=capabilities_map,
+            default_agent_factory=default_agent_factory,
         )
+        if isinstance(result, str):
+            return result
+        agent, config = result
 
-        # A custom default_agent_factory owns the whole agent build and only
-        # receives `config`, so any toolsets/capabilities collected here
-        # cannot be injected. Rather than silently dropping them while the
-        # success message still reports them as enabled, reject the request so
-        # the caller knows capabilities are unsupported with a custom factory.
-        if default_agent_factory is not None and capabilities:
-            return (
-                "Error: capabilities are not supported when a custom "
-                "default_agent_factory is configured. The factory builds the "
-                "agent itself; create the agent without capabilities or "
-                "configure the factory to attach the required toolsets."
-            )
-
-        # Collect toolsets
-        agent_toolsets: list[Any] = []
-        if toolsets_factory:
-            agent_toolsets.extend(toolsets_factory(ctx.deps))
-        elif capabilities and capabilities_map:
-            for cap_name in capabilities:
-                cap_factory = capabilities_map[cap_name]
-                agent_toolsets.extend(cap_factory(ctx.deps))
-
-        # Create agent
         try:
-            if default_agent_factory is not None:
-                agent: Any = default_agent_factory(config)
-            else:
-                agent = Agent(
-                    actual_model,
-                    system_prompt=instructions,
-                    toolsets=agent_toolsets or None,
-                )
-
             registry.register(config, agent)
-
-            caps_info = f"\nCapabilities: {', '.join(capabilities)}" if capabilities else ""
-            return (
-                f"Agent '{name}' created successfully.\n"
-                f"Model: {actual_model}\n"
-                f"Description: {description}{caps_info}\n"
-                f"Use task(description, '{name}') to delegate tasks."
-            )
-
         except ValueError as e:
             return f"Error: {e}"
-        except Exception as e:
-            return f"Error creating agent: {e}"
+
+        caps_info = f"\nCapabilities: {', '.join(capabilities)}" if capabilities else ""
+        return (
+            f"Agent '{name}' created successfully.\n"
+            f"Model: {actual_model}\n"
+            f"Description: {description}{caps_info}\n"
+            f"Use task(description, '{name}') to delegate tasks."
+        )
 
     @toolset.tool
     async def list_agents(

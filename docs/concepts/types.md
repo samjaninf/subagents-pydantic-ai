@@ -100,6 +100,29 @@ ExecutionMode = Literal["sync", "async", "auto"]
 | `async` | Run in background |
 | `auto` | Automatically decide |
 
+### DelegationConfiguration
+
+Controls the delegation entry-point tools exposed by `create_subagent_toolset`
+and `SubAgentCapability`.
+
+```python
+from subagents_pydantic_ai import DelegationConfiguration
+
+DelegationConfiguration = Literal[
+    "default",
+    "persisted",
+    "persisted_and_oneshot",
+    "oneshot_only",
+]
+```
+
+| Mode | Entry-point tools |
+|------|-------------------|
+| `default` | `task` |
+| `persisted` | `create_agent`, `task` |
+| `persisted_and_oneshot` | `create_agent`, `task`, `delegate` |
+| `oneshot_only` | `delegate` |
+
 ### TaskStatus
 
 Status of a background task.

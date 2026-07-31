@@ -32,9 +32,16 @@ from pydantic_ai import RunContext, UsageLimits
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.toolsets import AbstractToolset
 
+from subagents_pydantic_ai.dynamic_agent import AgentFactory, CapabilityFactory
 from subagents_pydantic_ai.prompts import get_subagent_system_prompt
+from subagents_pydantic_ai.registry import DynamicAgentRegistry
 from subagents_pydantic_ai.toolset import create_subagent_toolset
-from subagents_pydantic_ai.types import SubAgentConfig, ToolsetFactory, UsageLimitsFactory
+from subagents_pydantic_ai.types import (
+    DelegationConfiguration,
+    SubAgentConfig,
+    ToolsetFactory,
+    UsageLimitsFactory,
+)
 
 
 @dataclass
@@ -71,10 +78,28 @@ class SubAgentCapability(AbstractCapability[Any]):
         descriptions: Custom tool descriptions override.
         usage_limits: Optional static or per-task usage limits for delegated
             subagent runs.
+        delegation_configuration: Select default, persisted, combined, or
+            one-shot-only delegation entry points. A mode that hides a tool
+            rejects that tool's configuration rather than ignoring it — see
+            `Raises`.
+        allowed_models: Optional model allow-list for dynamic specialists.
+        capabilities_map: Optional capability factories for dynamic specialists.
+        default_agent_factory: Optional custom agent factory for dynamic specialists.
+            Do not attach an `ask_parent` toolset in the factory; the toolset
+            injects it at run time when needed.
+        max_agents: Maximum number of persistent dynamic agents, applied to the
+            registry the toolset creates for `create_agent`. Ignored when
+            `registry` is set — that registry keeps its own `max_agents`.
         max_result_chars: Character budget for a completed task's result in the
             `wait_tasks` listing. Truncated results carry an explicit marker
             pointing at `check_task`, which always returns the full text. Pass
             `None` to never truncate.
+
+    Raises:
+        ValueError: From `create_subagent_toolset` when the configuration is
+            self-contradictory — an invalid `delegation_configuration`, or one
+            whose hidden tools make `subagents`, `registry`, `allowed_models`,
+            `capabilities_map`, or `default_agent_factory` unreachable.
     """
 
     subagents: list[SubAgentConfig] | None = None
@@ -82,9 +107,14 @@ class SubAgentCapability(AbstractCapability[Any]):
     include_general_purpose: bool = True
     max_nesting_depth: int = 0
     toolsets_factory: ToolsetFactory | None = None
-    registry: Any = None
+    registry: DynamicAgentRegistry | None = None
     descriptions: dict[str, str] | None = None
     usage_limits: UsageLimits | UsageLimitsFactory | None = None
+    delegation_configuration: DelegationConfiguration = "default"
+    allowed_models: list[str] | None = None
+    capabilities_map: dict[str, CapabilityFactory] | None = None
+    default_agent_factory: AgentFactory | None = None
+    max_agents: int = 10
     max_result_chars: int | None = 2000
     _toolset: AbstractToolset[Any] | None = field(default=None, init=False, repr=False)
 
@@ -100,6 +130,11 @@ class SubAgentCapability(AbstractCapability[Any]):
             registry=self.registry,
             descriptions=self.descriptions,
             usage_limits=self.usage_limits,
+            delegation_configuration=self.delegation_configuration,
+            allowed_models=self.allowed_models,
+            capabilities_map=self.capabilities_map,
+            default_agent_factory=self.default_agent_factory,
+            max_agents=self.max_agents,
             max_result_chars=self.max_result_chars,
         )
 
@@ -122,6 +157,12 @@ class SubAgentCapability(AbstractCapability[Any]):
         configs = list(self.subagents) if self.subagents else []
 
         def _instructions(ctx: RunContext[Any]) -> str:
+            if self.delegation_configuration == "oneshot_only":
+                return (
+                    "## One-Shot Delegation\n\n"
+                    "Use the `delegate` tool to create an ephemeral specialist "
+                    "and run a task in one call."
+                )
             return get_subagent_system_prompt(configs)
 
         return _instructions

@@ -81,6 +81,20 @@ ExecutionMode = Literal["sync", "async", "auto"]
 - auto: Automatically decide based on task characteristics
 """
 
+DelegationConfiguration = Literal[
+    "default",
+    "persisted",
+    "persisted_and_oneshot",
+    "oneshot_only",
+]
+"""Controls which delegation entry-point tools are exposed.
+
+- default: Expose ``task`` only (backward-compatible with existing users)
+- persisted: Expose ``create_agent`` and ``task``
+- persisted_and_oneshot: Expose ``create_agent``, ``task``, and ``delegate``
+- oneshot_only: Expose only ``delegate`` as the delegation entry point
+"""
+
 
 class TaskPriority(str, Enum):
     """Priority levels for background tasks."""

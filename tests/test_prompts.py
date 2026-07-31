@@ -5,6 +5,7 @@ from __future__ import annotations
 from subagents_pydantic_ai import SubAgentConfig
 from subagents_pydantic_ai.prompts import (
     DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
+    DELEGATE_TOOL_DESCRIPTION,
     DUAL_MODE_SYSTEM_PROMPT,
     SUBAGENT_SYSTEM_PROMPT,
     TASK_TOOL_DESCRIPTION,
@@ -38,6 +39,12 @@ class TestSystemPrompts:
         assert "sync" in TASK_TOOL_DESCRIPTION
         assert "async" in TASK_TOOL_DESCRIPTION
         assert "subagent_type" in TASK_TOOL_DESCRIPTION
+
+    def test_delegate_tool_description(self):
+        """Test DELEGATE_TOOL_DESCRIPTION has expected content."""
+        assert "ephemeral" in DELEGATE_TOOL_DESCRIPTION.lower()
+        assert "create_agent" in DELEGATE_TOOL_DESCRIPTION
+        assert "instructions" in DELEGATE_TOOL_DESCRIPTION
 
 
 class TestGetSubagentSystemPrompt:

@@ -25,9 +25,15 @@ toolset = create_subagent_toolset(subagents=subagents)
 | `subagents` | `list[SubAgentConfig]` | `[]` | List of subagent configurations |
 | `default_model` | `str \| None` | `None` | Default model for subagents |
 | `toolsets_factory` | `Callable` | `None` | Factory to create toolsets for subagents |
-| `max_nesting_depth` | `int` | `2` | Maximum subagent nesting depth |
-| `general_purpose_config` | `SubAgentConfig \| None` | Auto | Config for the "general" subagent |
+| `include_general_purpose` | `bool` | `True` | Include the general-purpose subagent |
+| `max_nesting_depth` | `int` | `0` | Maximum subagent nesting depth |
+| `registry` | `DynamicAgentRegistry \| None` | `None` | Registry for dynamically created agents |
 | `descriptions` | `dict[str, str] \| None` | `None` | Override default tool descriptions by tool name |
+| `delegation_configuration` | `DelegationConfiguration` | `"default"` | Controls whether task-only, persisted, one-shot, or combined entry points are exposed |
+| `allowed_models` | `list[str] \| None` | `None` | Model allow-list for dynamic specialists |
+| `capabilities_map` | `dict[str, Callable] \| None` | `None` | Capability factories for dynamic specialists |
+| `default_agent_factory` | `Callable \| None` | `None` | Custom agent factory for dynamic specialists |
+| `max_agents` | `int` | `10` | Maximum persistent agents in an internally created registry |
 | `max_chat_traces` | `int` | `100` | Max subagent conversations kept for `chat_trace_id` continuation (LRU-evicted) |
 | `max_task_handles` | `int` | `500` | Max finished task handles retained for status/observability (oldest evicted; usage totals preserved) |
 | `max_result_chars` | `int \| None` | `2000` | Character budget for a result shown by `wait_tasks`; longer results are cut with an explicit marker. `None` disables truncation |
@@ -91,6 +97,23 @@ See [SubAgentConfig](types.md#subagentconfig) for full documentation of the `age
 
 The toolset provides these tools to your agent:
 
+### Delegation modes
+
+| Mode | Entry-point tools |
+|------|-------------------|
+| `"default"` | `task` |
+| `"persisted"` | `create_agent`, `task` |
+| `"persisted_and_oneshot"` | `create_agent`, `task`, `delegate` |
+| `"oneshot_only"` | `delegate` |
+
+Task lifecycle tools remain available in every mode so async work can be checked,
+steered, awaited, answered, or cancelled.
+
+### create_agent
+
+Create and register a reusable specialist. The resulting name can be passed to
+`task` multiple times.
+
 ### task
 
 Delegate a task to a subagent.
@@ -115,10 +138,13 @@ task(
 
 #### Stateful conversations (`chat_trace_id`)
 
-Every successful task result ends with a `Chat Trace ID: <id>` line. Passing
+Every successful `task()` result ends with a `Chat Trace ID: <id>` line. Passing
 that ID back to `task()` resumes the same subagent conversation: the subagent
 sees the full message history of its previous run and continues from there.
 Omit `chat_trace_id` to start a fresh conversation.
+
+`delegate()` results carry no trace ID, because a one-shot specialist is never
+registered and so cannot be named in a follow-up `task()` call.
 
 ```python
 # First task — a new conversation is created automatically:
@@ -144,9 +170,37 @@ Rules and limits:
   first run failed) returns an error instead of silently starting over.
 - Only the `max_chat_traces` most recently used conversations are kept
   (default 100, configurable on `create_subagent_toolset`); older ones are
-  evicted to bound memory in long-lived sessions.
+  evicted to bound memory in long-lived sessions. One-shot `delegate` runs are
+  not stored, so they never evict a conversation you can still continue.
 - History grows with every continuation — the full prior conversation is
   replayed on each resumed run, so long traces cost more tokens per call.
+
+### delegate
+
+Create an ephemeral specialist and delegate a task in one call. Available in
+`"persisted_and_oneshot"` and `"oneshot_only"` modes.
+
+```python
+# The agent calls:
+delegate(
+    description="Analyze this dataset and summarize key trends",
+    instructions="You are a data analyst. Return concise findings.",
+    mode="sync",
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `description` | `str` | Task prompt for the specialist |
+| `instructions` | `str` | Specialist system prompt |
+| `model` | `str \| None` | Optional model override |
+| `capabilities` | `list[str] \| None` | Optional capability names |
+| `can_ask_questions` | `bool` | Whether the specialist can ask the parent |
+| `mode` | `str` | `"sync"`, `"async"`, or `"auto"` |
+
+The specialist is not registered and cannot be reused by name.
 
 ### check_task
 

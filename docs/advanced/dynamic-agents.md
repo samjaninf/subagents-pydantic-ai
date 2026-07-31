@@ -1,6 +1,6 @@
 # Dynamic Agent Creation
 
-Create specialized agents at runtime using the agent factory toolset.
+Create reusable or ephemeral specialized agents at runtime.
 
 ## Overview
 
@@ -10,14 +10,14 @@ While pre-configured subagents cover most use cases, sometimes you need to creat
 - Task requires a unique combination of capabilities
 - Experimentation with different agent configurations
 
-## Agent Factory Toolset
+## Delegation Toolset
 
-Add dynamic creation capabilities:
+`create_subagent_toolset` exposes `task` by default. Opt into persistent
+creation with `delegation_configuration="persisted"`:
 
 ```python
 from subagents_pydantic_ai import (
     create_subagent_toolset,
-    create_agent_factory_toolset,
     DynamicAgentRegistry,
 )
 
@@ -26,14 +26,12 @@ registry = DynamicAgentRegistry()
 agent = Agent(
     "openai:gpt-4o",
     deps_type=Deps,
-    toolsets=[
-        create_subagent_toolset(subagents=base_subagents),
-        create_agent_factory_toolset(
-            registry=registry,
-            allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
-            max_agents=5,
-        ),
-    ],
+    toolsets=[create_subagent_toolset(
+        subagents=base_subagents,
+        registry=registry,
+        delegation_configuration="persisted",
+        allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
+    )],
 )
 ```
 
@@ -41,16 +39,16 @@ agent = Agent(
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `registry` | `DynamicAgentRegistry` | Required | Registry for created agents |
+| `registry` | `DynamicAgentRegistry \| None` | `None` | Registry for created agents; an internal registry is created when omitted |
 | `allowed_models` | `list[str] \| None` | `None` (all allowed) | Models agents can use |
 | `default_model` | `str \| Model` | `"openai:gpt-4.1"` | Default model for new agents when none is given |
 | `max_agents` | `int` | `10` | Maximum dynamic agents |
 | `toolsets_factory` | `ToolsetFactory \| None` | `None` | Factory that builds toolsets for every new agent. Takes priority over `capabilities_map` when both are set |
 | `capabilities_map` | `dict[str, CapabilityFactory] \| None` | `None` | Maps capability names to factory functions, e.g. `{"filesystem": ..., "todo": ...}`. Used when `capabilities` are passed to `create_agent` |
-| `id` | `str \| None` | `None` (-> `"agent_factory"`) | Optional toolset ID |
+| `delegation_configuration` | `DelegationConfiguration` | `"default"` | Select default, persisted, combined, or one-shot-only entry points |
 | `default_agent_factory` | `Callable \| None` | `None` | Factory used to build every dynamic agent |
 
-See [`create_agent_factory_toolset`][subagents_pydantic_ai.factory.create_agent_factory_toolset]
+See [`create_subagent_toolset`][subagents_pydantic_ai.toolset.create_subagent_toolset]
 for the full signature.
 
 ## DynamicAgentRegistry
@@ -314,16 +312,125 @@ create_agent_factory_toolset(
 
 ### Agent Limits
 
-Prevent unlimited agent creation:
+Prevent unlimited agent creation when the toolset creates its internal registry:
 
 ```python
-create_agent_factory_toolset(
-    registry=registry,
+create_subagent_toolset(
+    delegation_configuration="persisted",
     max_agents=3,  # Maximum 3 dynamic agents
 )
 ```
 
 After reaching the limit, creating new agents will fail until existing ones are removed.
+
+`max_agents` only applies to the registry `create_subagent_toolset` builds for
+itself. Pass your own `registry` and it keeps its own cap instead.
+
+#### Letting the parent free a slot
+
+`create_subagent_toolset` exposes no `remove_agent` tool, so a parent in
+`"persisted"` or `"persisted_and_oneshot"` cannot free a slot once `max_agents`
+is hit — it is told to remove an agent with no tool to do it. Give it the
+management tools from `create_agent_factory_toolset` over a shared registry, and
+leave the subagent toolset on `"default"`:
+
+```python
+registry = DynamicAgentRegistry()
+
+agent = Agent(
+    "openai:gpt-4o",
+    toolsets=[
+        # Task-only. Creating, listing and removing agents lives in the factory
+        # toolset, the only one that exposes `remove_agent`.
+        create_subagent_toolset(registry=registry),
+        create_agent_factory_toolset(registry=registry, max_agents=3),
+    ],
+)
+```
+
+Agents the parent creates are immediately reachable through `task`, because both
+toolsets share one registry.
+
+!!! warning "One owner for `create_agent`"
+
+    Do not combine `"persisted"` or `"persisted_and_oneshot"` with
+    `create_agent_factory_toolset`. Both define a tool named `create_agent`, and
+    pydantic-ai rejects duplicate tool names across toolsets at run time:
+
+    ```
+    UserError: FunctionToolset 'agent_factory' defines a tool whose name conflicts
+    with existing tool from FunctionToolset 'subagents': 'create_agent'.
+    ```
+
+    Pick one owner for agent creation: `"persisted"` for creation without
+    management, or `"default"` plus the factory toolset for both. Note that
+    `create_agent_factory_toolset` writes its `max_agents` onto the registry, so
+    pass the limit there rather than to `DynamicAgentRegistry(...)`.
+
+## Delegation Modes
+
+`delegation_configuration` controls the primary tools exposed to the parent:
+
+| Mode | Entry-point tools | Use case |
+|------|-------------------|----------|
+| `"default"` | `task` | Backward-compatible configured/registry delegation |
+| `"persisted"` | `create_agent`, `task` | Reusable specialists |
+| `"persisted_and_oneshot"` | `create_agent`, `task`, `delegate` | Reusable and ad-hoc specialists |
+| `"oneshot_only"` | `delegate` | Minimal one-shot delegation |
+
+Async lifecycle tools such as `check_task` remain available in every mode.
+
+A mode that hides a tool also hides that tool's configuration, so passing
+configuration the mode can never consult raises `ValueError` at construction
+instead of being dropped in silence:
+
+| Mode | Rejects | Because |
+|------|---------|---------|
+| `"oneshot_only"` | `subagents`, `registry` | Only `task` can reach either |
+| `"default"` | `allowed_models`, `capabilities_map`, `default_agent_factory` | Only `create_agent` / `delegate` consult them |
+
+Custom `default_agent_factory` implementations should not attach an
+`ask_parent` toolset; the toolset injects it at run time for registry-backed
+and one-shot agents.
+
+```python
+from subagents_pydantic_ai import create_subagent_toolset
+
+toolset = create_subagent_toolset(
+    delegation_configuration="persisted_and_oneshot",
+    allowed_models=["openai:gpt-4o", "openai:gpt-4o-mini"],
+    capabilities_map={
+        "filesystem": lambda deps: [create_fs_toolset(deps.backend)],
+    },
+)
+```
+
+### `delegate` Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `description` | `str` | Task prompt for the specialist |
+| `instructions` | `str` | Specialist system prompt |
+| `model` | `str \| None` | Optional model override |
+| `capabilities` | `list[str] \| None` | Optional capability names |
+| `can_ask_questions` | `bool` | Whether the specialist can ask the parent (default: `True`) |
+| `mode` | `str` | `"sync"`, `"async"`, or `"auto"` (default: `"sync"`) |
+
+### Registry Semantics
+
+One-shot specialists are **ephemeral**:
+
+- They are **not** registered in `DynamicAgentRegistry`
+- They do **not** count toward `max_agents`
+- They cannot be reused via `task(subagent_type=...)`
+- An internal name like `oneshot-{task_id}` is generated for logging and async task handles
+- They report **no chat trace**. A `Chat Trace ID` is only useful if `task` can
+  resolve the subagent it belongs to, which is never true for a one-shot, so
+  `delegate` results omit it and one-shot runs never occupy a slot in the
+  `max_chat_traces` LRU that a continuable conversation could use. Use
+  `create_agent` + `task` when you want a resumable conversation.
+
+Use `delegate` for ad-hoc specialists. Use `create_agent` + `task` when you need a reusable agent that persists in the registry.
 
 ### Naming Conflicts
 

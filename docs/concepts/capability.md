@@ -50,8 +50,37 @@ SubAgentCapability(
     usage_limits=UsageLimits(           # Static limits, or a factory (see below)
         request_limit=10,
     ),
+    delegation_configuration="default", # Task-only, persisted, combined, or oneshot
+    allowed_models=None,                # Model allow-list for dynamic specialists
+    capabilities_map=None,              # Capability factories for dynamic specialists
+    default_agent_factory=None,         # Custom agent factory for dynamic specialists
+    max_agents=10,                      # Persistent-agent limit
 )
 ```
+
+### Delegation configuration
+
+Choose which delegation entry points the capability exposes:
+
+| Mode | Entry-point tools |
+|------|-------------------|
+| `"default"` | `task` |
+| `"persisted"` | `create_agent`, `task` |
+| `"persisted_and_oneshot"` | `create_agent`, `task`, `delegate` |
+| `"oneshot_only"` | `delegate` |
+
+The one-shot `delegate` tool creates an ephemeral specialist and runs its task
+in one call. The specialist is not registered in the dynamic agent registry.
+
+```python
+SubAgentCapability(
+    delegation_configuration="persisted_and_oneshot",
+    allowed_models=["openai:gpt-4.1"],
+    capabilities_map={"filesystem": lambda deps: [create_fs_toolset(deps.backend)]},
+)
+```
+
+Use `delegate` for one-off specialists. Use `task` with pre-configured or registry-backed agents for reusable delegation.
 
 ### Usage limits
 
@@ -81,9 +110,9 @@ cap = SubAgentCapability(subagents=[...], usage_limits=limits_for)
 
 When you pass `SubAgentCapability` to an agent, pydantic-ai calls:
 
-1. **`get_toolset()`** — returns the `FunctionToolset` containing delegation tools
-   (`task`, `check_task`, `answer_subagent`, `list_active_tasks`, `wait_tasks`,
-   `soft_cancel_task`, `hard_cancel_task`)
+1. **`get_toolset()`** — returns the configured delegation entry points plus
+   task lifecycle tools (`check_task`, `answer_subagent`, `list_active_tasks`,
+   `wait_tasks`, `soft_cancel_task`, `hard_cancel_task`)
 
 2. **`get_instructions()`** — returns a callable that generates the system prompt
    listing available subagents with their descriptions (via

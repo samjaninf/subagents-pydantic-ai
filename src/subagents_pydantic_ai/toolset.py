@@ -20,11 +20,17 @@ from pydantic_ai import Agent, RunContext, UsageLimits
 from pydantic_ai.models import Model
 from pydantic_ai.toolsets import FunctionToolset
 
+from subagents_pydantic_ai.dynamic_agent import (
+    AgentFactory,
+    CapabilityFactory,
+    build_dynamic_agent,
+)
 from subagents_pydantic_ai.message_bus import InMemoryMessageBus, TaskManager
 from subagents_pydantic_ai.prompts import (
     ANSWER_SUBAGENT_DESCRIPTION,
     CHECK_TASK_DESCRIPTION,
     DEFAULT_GENERAL_PURPOSE_DESCRIPTION,
+    DELEGATE_TOOL_DESCRIPTION,
     HARD_CANCEL_TASK_DESCRIPTION,
     LIST_ACTIVE_TASKS_DESCRIPTION,
     SEND_MESSAGE_TO_SUBAGENT_DESCRIPTION,
@@ -35,11 +41,13 @@ from subagents_pydantic_ai.prompts import (
     get_task_instructions_prompt,
 )
 from subagents_pydantic_ai.protocols import SubAgentDepsProtocol
+from subagents_pydantic_ai.registry import DynamicAgentRegistry
 from subagents_pydantic_ai.retry import RetryConfig, run_with_retry
 from subagents_pydantic_ai.types import (
     AgentMessage,
     AskUserCallback,
     CompiledSubAgent,
+    DelegationConfiguration,
     ExecutionMode,
     MessageType,
     SubAgentConfig,
@@ -391,10 +399,15 @@ def create_subagent_toolset(  # noqa: C901
     include_general_purpose: bool = True,
     max_nesting_depth: int = 0,
     id: str | None = None,
-    registry: Any | None = None,
+    registry: DynamicAgentRegistry | None = None,
     descriptions: dict[str, str] | None = None,
     ask_user: AskUserCallback | None = None,
     usage_limits: UsageLimits | UsageLimitsFactory | None = None,
+    delegation_configuration: DelegationConfiguration = "default",
+    allowed_models: list[str] | None = None,
+    capabilities_map: dict[str, CapabilityFactory] | None = None,
+    default_agent_factory: AgentFactory | None = None,
+    max_agents: int = 10,
     max_chat_traces: int = 100,
     max_task_handles: int = 500,
     max_result_chars: int | None = 2000,
@@ -403,7 +416,9 @@ def create_subagent_toolset(  # noqa: C901
 
     This is the main entry point for using the subagent system. It creates
     a toolset with tools for:
-    - `task`: Delegate a task to a subagent (sync or async)
+    - `create_agent`: Create a reusable, registry-backed specialist (opt-in modes)
+    - `task`: Delegate a task to a configured or registry-backed specialist
+    - `delegate`: Create and run an ephemeral specialist in one call (opt-in modes)
     - `check_task`: Check status of an async task
     - `answer_subagent`: Answer a question from a subagent
     - `list_active_tasks`: List all running background tasks
@@ -437,6 +452,31 @@ def create_subagent_toolset(  # noqa: C901
             context and selected subagent config. A factory may return `None`
             to run that task without explicit limits. Limits are honoured on
             every retry attempt as well.
+        delegation_configuration: Controls the delegation entry points:
+            `"default"` exposes `task` only (backward-compatible);
+            `"persisted"` exposes `create_agent` and `task`;
+            `"persisted_and_oneshot"` also exposes `delegate`;
+            `"oneshot_only"` exposes only `delegate`.
+            Async task lifecycle tools remain available in every mode.
+            Custom factories that already attach `ask_parent` should not do so;
+            the toolset injects it at run time for registry-backed agents.
+            A mode that hides a tool rejects that tool's configuration rather
+            than ignoring it — see `Raises`.
+            `"persisted"` and `"persisted_and_oneshot"` expose a `create_agent`
+            tool of their own, so they cannot be combined with
+            `create_agent_factory_toolset` on one agent (pydantic-ai rejects the
+            duplicate tool name). Use `"default"` and let the factory toolset own
+            agent creation when you also want its `remove_agent`.
+        allowed_models: Optional model allow-list for dynamically created specialists.
+        capabilities_map: Optional capability factories for dynamically created
+            specialists.
+        default_agent_factory: Optional custom agent factory for dynamically
+            created specialists. When set, requested `capabilities` are rejected.
+            Do not attach an `ask_parent` toolset in the factory; the toolset
+            injects it at run time when needed.
+        max_agents: Maximum number of persistent dynamic agents, applied to the
+            registry this toolset creates for `create_agent`. Ignored when
+            `registry` is passed — that registry keeps its own `max_agents`.
         max_chat_traces: Maximum number of chat traces (subagent conversations)
             whose message history is kept in memory for continuation via
             `chat_trace_id`. Least-recently-used traces are evicted past this
@@ -457,7 +497,13 @@ def create_subagent_toolset(  # noqa: C901
         FunctionToolset configured with subagent management tools.
 
     Raises:
-        ValueError: If `max_result_chars` is negative.
+        ValueError: If `max_result_chars` is negative; if
+            `delegation_configuration` is invalid; if `"oneshot_only"` is
+            combined with `subagents` or a `registry`, neither of which is
+            reachable without `task`; or if a mode exposing neither
+            `create_agent` nor `delegate` is given `allowed_models`,
+            `capabilities_map`, or `default_agent_factory`, which only those
+            tools consult.
 
     Example:
         ```python
@@ -480,14 +526,76 @@ def create_subagent_toolset(  # noqa: C901
         agent = Agent("openai:gpt-4.1", toolsets=[toolset])
         ```
     """
+    valid_configurations = {
+        "default",
+        "persisted",
+        "persisted_and_oneshot",
+        "oneshot_only",
+    }
+    if delegation_configuration not in valid_configurations:
+        valid = ", ".join(sorted(valid_configurations))
+        raise ValueError(
+            f"Invalid delegation_configuration '{delegation_configuration}'. "
+            f"Expected one of: {valid}"
+        )
+
+    expose_create_agent = delegation_configuration in {
+        "persisted",
+        "persisted_and_oneshot",
+    }
+    expose_task = delegation_configuration != "oneshot_only"
+    expose_delegate = delegation_configuration in {
+        "persisted_and_oneshot",
+        "oneshot_only",
+    }
+
+    # Hiding a tool also hides everything only that tool reads, so configuration
+    # for a hidden tool can never take effect. Rejecting it here surfaces the
+    # contradiction at construction, where the caller can still see their own
+    # arguments; dropping it silently only shows up as a subagent that ignores
+    # an allow-list, or a capability the model is never offered.
+    if not expose_task:
+        if subagents:
+            raise ValueError(
+                f"delegation_configuration={delegation_configuration!r} cannot be combined "
+                "with non-empty subagents; configured subagents would be unreachable "
+                "without the task tool. Omit subagents, or use a mode that exposes task."
+            )
+        if registry is not None:
+            raise ValueError(
+                f"delegation_configuration={delegation_configuration!r} cannot be combined "
+                "with a registry; registry-backed agents are only reachable through the "
+                "task tool. Omit registry, or use a mode that exposes task."
+            )
+
+    if not expose_create_agent and not expose_delegate:
+        unreachable = [
+            name
+            for name, value in (
+                ("allowed_models", allowed_models),
+                ("capabilities_map", capabilities_map),
+                ("default_agent_factory", default_agent_factory),
+            )
+            if value is not None
+        ]
+        if unreachable:
+            raise ValueError(
+                f"delegation_configuration={delegation_configuration!r} exposes no "
+                f"dynamic-agent tool, so {', '.join(unreachable)} would be ignored. "
+                "Use 'persisted', 'persisted_and_oneshot', or 'oneshot_only'."
+            )
+
     if max_result_chars is not None and max_result_chars < 0:
         raise ValueError(f"max_result_chars must be >= 0 or None, got {max_result_chars}")
 
     _descs = descriptions or {}
+    active_registry = (
+        registry if registry is not None else DynamicAgentRegistry(max_agents=max_agents)
+    )
 
     # Build subagent configs
     configs: list[SubAgentConfig] = list(subagents) if subagents else []
-    if include_general_purpose:
+    if include_general_purpose and expose_task:
         configs.append(_create_general_purpose_config())
 
     # Compile subagents
@@ -535,69 +643,60 @@ def create_subagent_toolset(  # noqa: C901
 
     toolset: FunctionToolset[Any] = FunctionToolset(id=id or "subagents")
 
-    @toolset.tool(description=task_description)
-    async def task(
+    models_desc = (
+        f"Allowed models: {', '.join(allowed_models)}" if allowed_models else "Any model is allowed"
+    )
+    caps_desc = (
+        f"Available capabilities: {', '.join(capabilities_map.keys())}"
+        if capabilities_map
+        else "No predefined capabilities available"
+    )
+
+    async def execute_compiled_subagent(
         ctx: RunContext[SubAgentDepsProtocol],
+        subagent: CompiledSubAgent,
         description: str,
-        subagent_type: str,
-        mode: ExecutionMode = "sync",
-        priority: TaskPriority = TaskPriority.NORMAL,
-        complexity: Literal["simple", "moderate", "complex"] | None = None,
-        requires_user_context: bool = False,
-        may_need_clarification: bool = False,
+        *,
+        mode: ExecutionMode,
+        priority: TaskPriority,
+        complexity: Literal["simple", "moderate", "complex"] | None,
+        requires_user_context: bool,
+        may_need_clarification: bool,
+        inject_ask_parent: bool = False,
+        task_id: str | None = None,
         chat_trace_id: str | None = None,
+        persist_chat_trace: bool = True,
     ) -> str:
-        """Delegate a task to a specialized subagent.
+        """Run a compiled subagent with chat-trace and observability support.
 
-        Args:
-            ctx: The run context with dependencies.
-            description: Detailed description of the task to perform.
-            subagent_type: Name of the subagent to use.
-            mode: Execution mode - "sync" (blocking), "async" (background), or "auto".
-            priority: Task priority level (for async tasks).
-            complexity: Override complexity estimate ("simple", "moderate", "complex").
-            requires_user_context: Whether task needs ongoing user interaction.
-            may_need_clarification: Whether task might need clarifying questions.
-            chat_trace_id: Optional explicit chat trace ID. When omitted, a new subagent
-                conversation is created. When provided, this subagent resumes from
-                the previous successful task with the same chat trace.
+        `persist_chat_trace` must be `False` for a subagent the orchestrator
+        cannot address by name later — a one-shot specialist. A chat trace is
+        only worth handing out if `task` can resolve the subagent it belongs to,
+        and storing one costs a slot in the `max_chat_traces` LRU that a
+        continuable conversation would otherwise keep.
         """
-        # Validate subagent_type — check static compiled dict first, then dynamic registry
-        if subagent_type in compiled:
-            subagent = compiled[subagent_type]
-        elif (
-            registry is not None
-            and hasattr(registry, "get_compiled")
-            and registry.get_compiled(subagent_type)
-        ):
-            subagent = registry.get_compiled(subagent_type)
-        else:
-            # Build available list from both sources
-            available_names = list(compiled.keys())
-            if registry is not None and hasattr(registry, "list_agents"):
-                available_names.extend(registry.list_agents())
-            available = ", ".join(available_names)
-            return f"Error: Unknown subagent '{subagent_type}'. Available: {available}"
-
         config = subagent.config
         agent = subagent.agent
 
         if agent is None:
-            return f"Error: Subagent '{subagent_type}' is not properly initialized"
+            return f"Error: Subagent '{subagent.name}' is not properly initialized"
 
         resolved_usage_limits = (
             usage_limits(ctx, config) if callable(usage_limits) else usage_limits
         )
 
-        # Create deps for subagent
         parent_deps = ctx.deps
         subagent_deps = parent_deps.clone_for_subagent(max_nesting_depth - 1)
 
-        # Build runtime toolsets from factory if provided
-        runtime_toolsets = toolsets_factory(subagent_deps) if toolsets_factory else None
+        runtime_toolsets: list[Any] | None = None
+        if toolsets_factory or inject_ask_parent:
+            runtime_toolsets = []
+            if inject_ask_parent and config.get("can_ask_questions", True):
+                runtime_toolsets.append(_create_ask_parent_toolset())
+            if toolsets_factory:
+                runtime_toolsets.extend(toolsets_factory(subagent_deps))
 
-        # Generate task ID
-        task_id = str(uuid.uuid4())[:8]
+        actual_task_id = task_id or str(uuid.uuid4())[:8]
 
         effective_chat_trace_id = chat_trace_id or uuid.uuid4().hex
         chat_trace_key = (config["name"], effective_chat_trace_id)
@@ -609,7 +708,6 @@ def create_subagent_toolset(  # noqa: C901
             )
         message_history = message_history_store.get(chat_trace_key)
         if message_history is not None:
-            # Refresh LRU recency so actively-continued traces aren't evicted.
             message_history_store.move_to_end(chat_trace_key)
         elif chat_trace_id is not None:
             return (
@@ -624,10 +722,14 @@ def create_subagent_toolset(  # noqa: C901
             while len(message_history_store) > max_chat_traces:
                 message_history_store.popitem(last=False)
 
-        # Bound retained finished handles before registering a new one.
+        # A one-shot run exposes no chat trace, so it neither stores history nor
+        # reports an id: `handle.chat_trace_id` stays `None` and check_task /
+        # wait_tasks skip it for the same reason the returned text does.
+        on_history = save_message_history if persist_chat_trace else None
+        reported_chat_trace_id = effective_chat_trace_id if persist_chat_trace else None
+
         evict_finished_handles()
 
-        # Resolve mode if "auto"
         if mode == "auto":
             characteristics = TaskCharacteristics(
                 estimated_complexity=complexity or config.get("typical_complexity", "moderate"),
@@ -641,15 +743,15 @@ def create_subagent_toolset(  # noqa: C901
 
         if resolved_mode == "sync":
             handle = TaskHandle(
-                task_id=task_id,
+                task_id=actual_task_id,
                 subagent_name=config["name"],
                 description=description,
                 status=TaskStatus.RUNNING,
                 priority=priority,
-                chat_trace_id=effective_chat_trace_id,
+                chat_trace_id=reported_chat_trace_id,
                 started_at=datetime.now(),
             )
-            task_manager.handles[task_id] = handle
+            task_manager.handles[actual_task_id] = handle
             active_chat_traces.add(chat_trace_key)
             try:
                 result = await _run_sync(
@@ -657,45 +759,217 @@ def create_subagent_toolset(  # noqa: C901
                     config=config,
                     description=description,
                     deps=subagent_deps,
-                    task_id=task_id,
+                    task_id=actual_task_id,
                     extra_toolsets=runtime_toolsets,
                     ask_user=ask_user,
                     usage_limits=resolved_usage_limits,
                     handle=handle,
                     message_history=message_history,
-                    on_message_history=save_message_history,
+                    on_message_history=on_history,
                 )
             finally:
                 active_chat_traces.discard(chat_trace_key)
-            # Don't advertise continuation when the run failed and nothing was
-            # ever saved for this trace — the chat_trace_id would resume nothing.
-            if handle.status != TaskStatus.FAILED or chat_trace_key in message_history_store:
+            if persist_chat_trace and (
+                handle.status != TaskStatus.FAILED or chat_trace_key in message_history_store
+            ):
                 return _format_chat_trace_result(result, effective_chat_trace_id)
             return result
-        else:
-            active_chat_traces.add(chat_trace_key)
+
+        active_chat_traces.add(chat_trace_key)
+        try:
+            return await _run_async(
+                agent=agent,
+                config=config,
+                description=description,
+                deps=subagent_deps,
+                task_id=actual_task_id,
+                task_manager=task_manager,
+                message_bus=message_bus,
+                extra_toolsets=runtime_toolsets,
+                priority=priority,
+                usage_limits=resolved_usage_limits,
+                chat_trace_id=reported_chat_trace_id,
+                message_history=message_history,
+                on_message_history=on_history,
+                on_run_finished=lambda: active_chat_traces.discard(chat_trace_key),
+            )
+        except BaseException:
+            active_chat_traces.discard(chat_trace_key)
+            raise
+
+    if expose_create_agent:
+        create_agent_description = _descs.get(
+            "create_agent",
+            "Create a reusable specialized agent at runtime. The agent is stored "
+            "in the registry and can be used repeatedly with the task tool.\n\n"
+            f"{models_desc}\n{caps_desc}\n\n"
+            f"Default model when none is given: {default_model}.",
+        )
+
+        @toolset.tool(description=create_agent_description)
+        async def create_agent(
+            ctx: RunContext[SubAgentDepsProtocol],
+            name: str,
+            description: str,
+            instructions: str,
+            model: str | None = None,
+            capabilities: list[str] | None = None,
+            can_ask_questions: bool = True,
+        ) -> str:
+            """Create and register a reusable specialized agent."""
+            if active_registry.exists(name):
+                return f"Error: Agent '{name}' already exists"
+
+            actual_model = model or default_model
+            result = build_dynamic_agent(
+                ctx,
+                name=name,
+                description=description,
+                instructions=instructions,
+                model=actual_model,
+                can_ask_questions=can_ask_questions,
+                capabilities=capabilities,
+                allowed_models=allowed_models,
+                toolsets_factory=None,
+                capabilities_map=capabilities_map,
+                default_agent_factory=default_agent_factory,
+            )
+            if isinstance(result, str):
+                return result
+            agent, config = result
+
             try:
-                return await _run_async(
-                    agent=agent,
-                    config=config,
-                    description=description,
-                    deps=subagent_deps,
-                    task_id=task_id,
-                    task_manager=task_manager,
-                    message_bus=message_bus,
-                    extra_toolsets=runtime_toolsets,
-                    priority=priority,
-                    usage_limits=resolved_usage_limits,
-                    chat_trace_id=effective_chat_trace_id,
-                    message_history=message_history,
-                    on_message_history=save_message_history,
-                    # The background task owns the trace until it finishes.
-                    on_run_finished=lambda: active_chat_traces.discard(chat_trace_key),
-                )
-            except BaseException:
-                # _run_async failed before the background task took ownership.
-                active_chat_traces.discard(chat_trace_key)
-                raise
+                active_registry.register(config, agent)
+            except ValueError as exc:
+                return f"Error: {exc}"
+
+            caps_info = f"\nCapabilities: {', '.join(capabilities)}" if capabilities else ""
+            return (
+                f"Agent '{name}' created successfully.\n"
+                f"Model: {actual_model}\n"
+                f"Description: {description}{caps_info}\n"
+                f"Use task(description, '{name}') to delegate tasks."
+            )
+
+    if expose_task:
+
+        @toolset.tool(description=task_description)
+        async def task(
+            ctx: RunContext[SubAgentDepsProtocol],
+            description: str,
+            subagent_type: str,
+            mode: ExecutionMode = "sync",
+            priority: TaskPriority = TaskPriority.NORMAL,
+            complexity: Literal["simple", "moderate", "complex"] | None = None,
+            requires_user_context: bool = False,
+            may_need_clarification: bool = False,
+            chat_trace_id: str | None = None,
+        ) -> str:
+            """Delegate a task to a specialized subagent.
+
+            Args:
+                ctx: The run context with dependencies.
+                description: Detailed description of the task to perform.
+                subagent_type: Name of the subagent to use.
+                mode: Execution mode - "sync" (blocking), "async" (background), or "auto".
+                priority: Task priority level (for async tasks).
+                complexity: Override complexity estimate ("simple", "moderate", "complex").
+                requires_user_context: Whether task needs ongoing user interaction.
+                may_need_clarification: Whether task might need clarifying questions.
+                chat_trace_id: Optional explicit chat trace ID. When omitted, a new subagent
+                    conversation is created. When provided, this subagent resumes from
+                    the previous successful task with the same chat trace.
+            """
+            if subagent_type in compiled:
+                subagent = compiled[subagent_type]
+                inject_ask_parent = False
+            elif (registry_subagent := active_registry.get_compiled(subagent_type)) is not None:
+                subagent = registry_subagent
+                inject_ask_parent = True
+            else:
+                available_names = list(compiled.keys())
+                available_names.extend(active_registry.list_agents())
+                available = ", ".join(available_names)
+                return f"Error: Unknown subagent '{subagent_type}'. Available: {available}"
+
+            return await execute_compiled_subagent(
+                ctx,
+                subagent,
+                description,
+                mode=mode,
+                priority=priority,
+                complexity=complexity,
+                requires_user_context=requires_user_context,
+                may_need_clarification=may_need_clarification,
+                inject_ask_parent=inject_ask_parent,
+                chat_trace_id=chat_trace_id,
+            )
+
+    if expose_delegate:
+        delegate_description = _descs.get(
+            "delegate",
+            DELEGATE_TOOL_DESCRIPTION.rstrip()
+            + f"\n\n{models_desc}\n{caps_desc}\n\n"
+            + f"Default model when none is given: {default_model}.",
+        )
+
+        @toolset.tool(description=delegate_description)
+        async def delegate(
+            ctx: RunContext[SubAgentDepsProtocol],
+            description: str,
+            instructions: str,
+            model: str | None = None,
+            capabilities: list[str] | None = None,
+            can_ask_questions: bool = True,
+            mode: ExecutionMode = "sync",
+            priority: TaskPriority = TaskPriority.NORMAL,
+            complexity: Literal["simple", "moderate", "complex"] | None = None,
+            requires_user_context: bool = False,
+            may_need_clarification: bool = False,
+        ) -> str:
+            """Create an ephemeral specialist and delegate a task in one call."""
+            task_id = str(uuid.uuid4())[:8]
+            agent_name = f"oneshot-{task_id}"
+            agent_description = description[:120] or "Ephemeral specialist"
+            actual_model = model or default_model
+
+            result = build_dynamic_agent(
+                ctx,
+                name=agent_name,
+                description=agent_description,
+                instructions=instructions,
+                model=actual_model,
+                can_ask_questions=can_ask_questions,
+                capabilities=capabilities,
+                allowed_models=allowed_models,
+                toolsets_factory=None,
+                capabilities_map=capabilities_map,
+                default_agent_factory=default_agent_factory,
+            )
+            if isinstance(result, str):
+                return result
+            agent, config = result
+
+            subagent = CompiledSubAgent(
+                name=agent_name,
+                description=agent_description,
+                agent=agent,
+                config=config,
+            )
+
+            return await execute_compiled_subagent(
+                ctx,
+                subagent,
+                description,
+                mode=mode,
+                priority=priority,
+                complexity=complexity,
+                requires_user_context=requires_user_context,
+                may_need_clarification=may_need_clarification,
+                inject_ask_parent=True,
+                task_id=task_id,
+                persist_chat_trace=False,
+            )
 
     @toolset.tool(description=_descs.get("check_task", CHECK_TASK_DESCRIPTION))
     async def check_task(
